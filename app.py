@@ -50,7 +50,7 @@ model_status = load_models_into_memory()
 
 # --- UI & EXECUTION ---
 st.markdown("### 1. Upload Candidates")
-uploaded_file = st.file_uploader("Upload sample_candidates.jsonl (Max 100 rows)", type=['jsonl'])
+uploaded_file = st.file_uploader("Upload sample_candidates.jsonl (Max 100 rows)", type=['json'])
 
 if uploaded_file is not None and model_status:
     # Save the uploaded file temporarily
