@@ -1,10 +1,8 @@
 import streamlit as st
 import pandas as pd
 import os
-import sys
 
 # Import your core pipeline's run function
-# Ensure rank_candidates.py is in the same directory
 try:
     from rank_candidates import run
 except ImportError:
@@ -31,14 +29,12 @@ Please upload a sample candidate file (≤ 100 rows) to execute the LTR cascade 
 def load_models_into_memory():
     """
     Forces the models to load into RAM once on startup.
-    This prevents OOM (Out of Memory) crashes when the UI thread tries to run.
+    This prevents OOM crashes when the UI thread tries to run.
     """
     with st.spinner("Initializing Neural Networks (BGE-Small & MS-Marco)..."):
-        # We wrap this in a try-except just in case the Streamlit environment 
-        # needs to download them dynamically if the offline models aren't pushed.
         try:
             from sentence_transformers import SentenceTransformer, CrossEncoder
-            # If you are using the local models folder, update these paths to "models/..."
+            # Uses models from HuggingFace or your offline 'models' folder if you pushed it
             SentenceTransformer('BAAI/bge-small-en-v1.5')
             CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
             return True
@@ -50,7 +46,8 @@ model_status = load_models_into_memory()
 
 # --- UI & EXECUTION ---
 st.markdown("### 1. Upload Candidates")
-uploaded_file = st.file_uploader("Upload sample_candidates.jsonl (Max 100 rows)", type=['json'])
+# Added 'jsonl' to accepted types because the dataset is candidates.jsonl
+uploaded_file = st.file_uploader("Upload sample_candidates.jsonl (Max 100 rows)", type=['jsonl', 'json'])
 
 if uploaded_file is not None and model_status:
     # Save the uploaded file temporarily
@@ -62,30 +59,47 @@ if uploaded_file is not None and model_status:
     
     st.markdown("### 2. Run Pipeline")
     if st.button("▶️ Execute Ranking Engine", type="primary"):
-        # The required output filename per your Team ID
         output_csv = "Real_RR.csv"  
         
         with st.spinner("Executing Stage 1 (BM25) → Stage 2 (Vector) → Stage 3 (Cross-Encoder)..."):
             try:
-                # Mock argparse object matching your rank_candidates.py logic
+                # -------------------------------------------------------------
+                # FULLY MAPPED ARGUMENTS (Prevents 'AttributeError')
+                # -------------------------------------------------------------
                 class DummyArgs:
-                    candidates = temp_input_path
                     jd_index = "jd_hybrid_index.json"
+                    candidates = temp_input_path
                     output = output_csv
                     
-                    # You ARE caching JD embeddings to save compute
-                    jd_embeddings_cache = "data/jd_vector_embeddings.npz"
+                    # Missing metadata attributes explicitly added
+                    metadata_output = "temp_ranking_metadata.json"
+                    l0_report_output = "temp_l0_triage_report.csv"
+                    stage1_report_output = "temp_stage1_bm25_report.csv"
+                    stage2_report_output = "temp_stage2_vector_report.csv"
+                    scores_output = ""
+                    chunk_scores_output = ""
+                    chunk_scores_limit = 1000
                     
-                    # You are NOT caching candidate vectors/cross scores. 
-                    # Pointing to temp paths ensures it runs LIVE on the 100 uploaded candidates.
-                    vector_scores_cache = "temp_vector_scores.npz"
-                    cross_scores_cache = "temp_cross_scores.npz"
+                    pre_shortlist_size = 1000
+                    shortlist_size = 150
+                    top_k = 100
+                    
+                    # CRITICAL FIX: If judges upload 50 candidates, pipeline won't crash
+                    allow_fewer_than_top_k = True 
+                    max_candidates = None
+                    as_of_date = "2026-06-09"
+                    
+                    vector_backend = "sentence-transformers"
+                    embedding_model = "BAAI/bge-small-en-v1.5"
+                    model_cache_dir = "models"
+                    
+                    # Use flat paths so Streamlit doesn't throw 'Folder not found'
+                    jd_embeddings_cache = "temp_jd_vector_embeddings.npz"
+                    vector_scores_cache = "temp_pre_shortlist_vector_scores.npz"
                     
                     cross_encoder_backend = "sentence-transformers"
-                    
-                    # Point these to your offline folder (e.g., 'models/...') if you used the chunking trick
-                    embedding_model = "BAAI/bge-small-en-v1.5" 
                     cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+                    cross_scores_cache = "temp_shortlist_cross_scores.npz"
                     
                     require_cross_encoder = True
                     batch_size = 32  # Small batch size to respect Streamlit RAM
@@ -95,13 +109,13 @@ if uploaded_file is not None and model_status:
                 # Trigger the main ranking pipeline
                 exit_code = run(DummyArgs())
                 
-                if exit_code == 0 and os.path.exists(output_csv):
+                # Some scripts return 'None' on success, so we handle both 0 and None
+                if exit_code in [0, None] and os.path.exists(output_csv):
                     st.success("✅ Pipeline executed successfully in under 5 minutes!")
                     
                     st.markdown("### 3. Review & Download Results")
                     df = pd.read_csv(output_csv)
                     
-                    # Display the top 100 rows nicely to the judges
                     st.dataframe(
                         df,
                         column_config={
