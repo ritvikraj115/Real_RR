@@ -24,6 +24,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import glob
+import gzip
 import os
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+.#/-]*")
@@ -1274,29 +1275,56 @@ def load_jd_index(path: Path) -> list[Chunk]:
 
 
 def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield candidate objects from JSON, JSONL, or gzipped JSON/JSONL.
+
+    The hackathon sample tooling sometimes renames pretty-printed JSON to *.jsonl.
+    We first try to parse the whole file as JSON, then fall back to line-delimited
+    parsing so both formats are accepted safely.
+    """
     suffix = path.suffix.lower()
-    if suffix == ".jsonl":
+    is_gz = path.name.lower().endswith(".gz")
+
+    if is_gz:
+        import gzip as _gzip  # local import keeps the dependency optional
+        with _gzip.open(path, "rt", encoding="utf-8") as f:
+            raw_text = f.read()
+    else:
         with path.open("r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+            raw_text = f.read()
+
+    raw_text = raw_text.strip()
+    if not raw_text:
         return
 
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        yield from data
-    elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
-        yield from data["candidates"]
-    elif isinstance(data, dict) and data.get("candidate_id"):
-        yield data
-    else:
-        raise ValueError(f"Unsupported candidate JSON structure in {path}")
+    def yield_from_parsed(data: Any) -> Iterable[dict[str, Any]]:
+        if isinstance(data, list):
+            yield from data
+        elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
+            yield from data["candidates"]
+        elif isinstance(data, dict) and data.get("candidate_id"):
+            yield data
+        else:
+            raise ValueError(f"Unsupported candidate JSON structure in {path}")
+
+    # First try a single JSON object / array. This handles pretty-printed JSON
+    # that may have been saved with a .jsonl extension by the sandbox UI.
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if parsed is not None:
+        yield from yield_from_parsed(parsed)
+        return
+
+    # Fall back to strict JSONL parsing.
+    for line_no, line in enumerate(raw_text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
 
 
 def build_candidate_text(candidate: dict[str, Any], as_of_date: date | None = None) -> list[str]:
@@ -2419,10 +2447,14 @@ def run(args: argparse.Namespace) -> int:
     candidate_path = Path(args.candidates)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path = Path(args.metadata_output) if args.metadata_output else None
-    l0_report_path = Path(args.l0_report_output) if args.l0_report_output else None
-    stage1_report_path = Path(args.stage1_report_output) if args.stage1_report_output else None
-    stage2_report_path = Path(args.stage2_report_output) if args.stage2_report_output else None
+    # Only the submission CSV should be produced during ranking.
+    # Keep all diagnostics disabled so the repo stays hackathon-compliant.
+    metadata_path = None
+    l0_report_path = None
+    stage1_report_path = None
+    stage2_report_path = None
+    args.scores_output = ""
+    args.chunk_scores_output = ""
     model_cache_dir = Path(args.model_cache_dir)
     jd_embeddings_cache = Path(args.jd_embeddings_cache)
 
