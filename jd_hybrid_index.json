@@ -1,0 +1,563 @@
+{
+  "doc_name": "redrob_jd_hybrid_index",
+  "version": "4.0",
+  "chunking_principles": [
+    "BM25 queries contain only unique, hard nouns and technical terms.",
+    "Vector queries use fluent, sentence-level descriptions for bge-small optimization.",
+    "Expanded texts are declarative True/False rubrics for the Cross-Encoder."
+  ],
+  "chunks": [
+    {
+      "id": "C01",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.95,
+      "importance_tier": "9",
+      "bm25_query": "search ranking retrieval recommendation matching engine relevance intelligence layer",
+      "vector_query": "Builds and owns the intelligence layer for semantic search, talent recommendation, and relevance ranking engines.",
+      "expanded_text": "The candidate explicitly states they have built or engineered ranking, retrieval, recommendation, or search relevance systems.",
+      "terms": [
+        "intelligence layer",
+        "candidate-JD matching",
+        "recruiter search",
+        "ranking",
+        "retrieval",
+        "matching systems"
+      ],
+      "do_not_duplicate_with": ["C05", "C13", "C25"],
+      "notes": "Captures the JD's central product mandate only; shipped-system proof belongs in C05.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C02",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 1.0,
+      "importance_tier": "10",
+      "bm25_query": "production embeddings retrieval deployed sentence transformers BGE E5 OpenAI vectorization dense vectors semantic similarity representation learning text-embedding-ada SBERT MiniLM",
+      "vector_query": "Deploys embeddings-based retrieval, semantic search, and dense retrievers using models like sentence-transformers, OpenAI embeddings, or BGE to real users.",
+      "expanded_text": "The candidate has explicit production experience building embeddings-based retrieval systems that reached real users.",
+      "terms": [
+        "embeddings-based retrieval",
+        "production retrieval",
+        "real users",
+        "sentence-transformers",
+        "OpenAI embeddings",
+        "BGE",
+        "E5"
+      ],
+      "do_not_duplicate_with": ["C03", "C04", "C05", "C25"],
+      "notes": "Highest-priority core requirement focused on deployed embedding retrieval.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C03",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.95,
+      "importance_tier": "9",
+      "bm25_query": "vector database hybrid search Pinecone Weaviate Qdrant Milvus OpenSearch Elasticsearch FAISS ANN HNSW Chroma pgvector Vespa Solr",
+      "vector_query": "Operates and scales vector databases, approximate nearest-neighbor search, and hybrid retrieval infrastructure like Pinecone, Weaviate, Milvus, or FAISS.",
+      "expanded_text": "The candidate has production experience operating and scaling vector databases or hybrid search infrastructure.",
+      "terms": [
+        "vector database",
+        "hybrid search",
+        "Pinecone",
+        "Weaviate",
+        "Qdrant",
+        "Milvus",
+        "OpenSearch",
+        "Elasticsearch",
+        "FAISS"
+      ],
+      "do_not_duplicate_with": ["C02", "C04", "C05", "C25"],
+      "notes": "Captures search infrastructure experience.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C04",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.95,
+      "importance_tier": "9",
+      "bm25_query": "embedding drift index refresh retrieval quality regression production operations versioning reindexing recall precision relevance monitoring evaluation dashboard",
+      "vector_query": "Handles production retrieval operations including embedding drift, index refresh, retrieval-quality regression, and recall monitoring.",
+      "expanded_text": "The candidate operates retrieval systems post-launch, actively managing embedding drift, index refresh, and retrieval-quality regressions.",
+      "terms": [
+        "embedding drift",
+        "index refresh",
+        "retrieval-quality regression",
+        "retrieval operations",
+        "quality monitoring",
+        "rollouts"
+      ],
+      "do_not_duplicate_with": ["C02", "C03", "C05", "C07", "C09", "C25"],
+      "notes": "Separates operational retrieval maintenance from merely having used embeddings.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C05",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 1.0,
+      "importance_tier": "10",
+      "bm25_query": "shipped end to end ranking search recommendation system real users production launched deployed recommender matching engine relevance service",
+      "vector_query": "Ships end-to-end ranking, retrieval, search, recommendation, or matching systems from design through production launch for real users.",
+      "expanded_text": "The candidate has explicitly taken a ranking, search, recommendation, or matching system from design through launch for real users.",
+      "terms": [
+        "shipped system",
+        "end-to-end ranking",
+        "search system",
+        "recommendation system",
+        "real users",
+        "production launch"
+      ],
+      "do_not_duplicate_with": ["C01", "C02", "C03", "C04", "C10", "C25"],
+      "notes": "Requires shipped-system proof.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C06",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.9,
+      "importance_tier": "9",
+      "bm25_query": "NDCG MRR MAP relevance benchmark ranking metrics evaluation Recall Precision HitRate DCG ERR qrels",
+      "vector_query": "Evaluates ranking systems using metrics and benchmarks like NDCG, MRR, MAP, Recall, Precision, and rigorous offline relevance measurement.",
+      "expanded_text": "The candidate actively uses formal ranking and search evaluation metrics such as NDCG, MRR, MAP, or relevance labeling.",
+      "terms": [
+        "NDCG",
+        "MRR",
+        "MAP",
+        "ranking metrics",
+        "relevance benchmarks",
+        "relevance labeling"
+      ],
+      "do_not_duplicate_with": ["C07", "C25"],
+      "notes": "Metric knowledge only; experimentation loops belong in C07.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C07",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.9,
+      "importance_tier": "9",
+      "bm25_query": "offline online correlation A B testing feedback loops experimentation infrastructure experiments interleaving click human labeling CTR conversion",
+      "vector_query": "Builds experimentation and feedback loops connecting offline relevance benchmarks with online A/B tests, interleaving, and click signals.",
+      "expanded_text": "The candidate builds evaluation infrastructure linking offline benchmarks to online A/B tests and engagement metrics.",
+      "terms": [
+        "offline-online correlation",
+        "A/B testing",
+        "recruiter-feedback loops",
+        "experimentation infrastructure",
+        "engagement metrics",
+        "online evaluation"
+      ],
+      "do_not_duplicate_with": ["C04", "C06", "C25"],
+      "notes": "Experimentation and feedback-loop signal only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C08",
+      "category": "must_have",
+      "polarity": "positive",
+      "weight": 0.9,
+      "importance_tier": "9",
+      "bm25_query": "strong Python production code quality hands on ML systems implementation FastAPI PyTorch scikit-learn sklearn pandas numpy backend API",
+      "vector_query": "Writes strong Python and production-quality ML systems code, including backend APIs and PyTorch or scikit-learn pipelines.",
+      "expanded_text": "The candidate writes production-quality Python code and builds hands-on ML systems and backend APIs.",
+      "terms": [
+        "strong Python",
+        "production code",
+        "code quality",
+        "hands-on implementation",
+        "ML systems"
+      ],
+      "do_not_duplicate_with": ["C09", "C21", "C25"],
+      "notes": "Captures the JD's explicit emphasis that this role writes code.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C09",
+      "category": "strong_positive",
+      "polarity": "positive",
+      "weight": 0.75,
+      "importance_tier": "8",
+      "bm25_query": "systems thinking architecture observability pipelines infrastructure tradeoff reasoning monitoring logging tracing SLO SLA reliability scalability orchestration Airflow Kubernetes Docker",
+      "vector_query": "Thinks in systems, architecture, observability, pipelines, reliability, scalability, orchestration, and engineering tradeoffs.",
+      "expanded_text": "The candidate demonstrates deep systems-thinking, focusing on architecture, observability, infrastructure design, and engineering tradeoffs.",
+      "terms": [
+        "systems thinking",
+        "architecture",
+        "observability",
+        "pipelines",
+        "infrastructure",
+        "tradeoff reasoning"
+      ],
+      "do_not_duplicate_with": ["C04", "C08", "C10", "C12", "C14", "C24", "C25"],
+      "notes": "Architecture and infrastructure reasoning only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C10",
+      "category": "culture",
+      "polarity": "positive",
+      "weight": 0.75,
+      "importance_tier": "8",
+      "bm25_query": "ship fast working v1 real users iterate learn product engineering MVP prototype launch user feedback agile rapid experimentation",
+      "vector_query": "Ships fast, launches practical MVP product systems, learns from real users, and iterates quickly with strong product engineering judgment.",
+      "expanded_text": "The candidate has a shipper mindset, willing to launch a working v1 quickly and iterate based on real user feedback.",
+      "terms": [
+        "ship fast",
+        "working v1",
+        "real users",
+        "iteration",
+        "product engineering",
+        "learn from users"
+      ],
+      "do_not_duplicate_with": ["C05", "C09", "C12", "C14", "C19", "C25"],
+      "notes": "Captures shipper-vs-researcher orientation.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C11",
+      "category": "strong_positive",
+      "polarity": "positive",
+      "weight": 0.65,
+      "importance_tier": "7",
+      "bm25_query": "recruiter workflow candidate matching talent intelligence marketplace ATS sourcing talent acquisition hiring resume screening recommendation",
+      "vector_query": "Understands recruiter workflows, sourcing, ATS hiring funnels, resume screening, talent intelligence, and marketplace matching context.",
+      "expanded_text": "The candidate has built products for recruiter workflows, talent intelligence, applicant tracking systems, or hiring marketplaces.",
+      "terms": [
+        "recruiter workflow",
+        "candidate matching",
+        "talent intelligence",
+        "marketplace matching",
+        "hiring product",
+        "recruiter experience"
+      ],
+      "do_not_duplicate_with": ["C01", "C07", "C25"],
+      "notes": "Narrowed to the JD's matching and recruiter-workflow context.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C12",
+      "category": "culture",
+      "polarity": "positive",
+      "weight": 0.65,
+      "importance_tier": "7",
+      "bm25_query": "ownership 0 to 1 ambiguity founding team build from scratch imperfect specs greenfield early stage zero to one startup product discovery",
+      "vector_query": "Takes ownership in ambiguous zero-to-one, greenfield, startup, or founding-team environments with imperfect specs.",
+      "expanded_text": "The candidate operates autonomously in zero-to-one founding environments, building from scratch with highly ambiguous requirements.",
+      "terms": [
+        "ownership",
+        "0-to-1",
+        "ambiguity tolerance",
+        "founding team",
+        "build from scratch",
+        "imperfect specs"
+      ],
+      "do_not_duplicate_with": ["C09", "C10", "C14", "C25"],
+      "notes": "Ownership and ambiguity only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C13",
+      "category": "strong_positive",
+      "polarity": "positive",
+      "weight": 0.55,
+      "importance_tier": "6",
+      "bm25_query": "LLM reranking based re ranking pipeline integration GenAI Generative AI RAG Retrieval Augmented Generation OpenAI Claude Llama Mistral LangChain HuggingFace agentic workflow cross encoder",
+      "vector_query": "Uses LLM-based reranking, GenAI, RAG, agentic workflows, or LLM integration with OpenAI, Claude, Llama, or LangChain inside retrieval pipelines.",
+      "expanded_text": "The candidate implements LLM-based reranking, RAG, or agentic workflows as part of a broader retrieval or ranking pipeline.",
+      "terms": [
+        "LLM reranking",
+        "LLM integration",
+        "ranking pipeline",
+        "re-ranking",
+        "retrieval pipeline"
+      ],
+      "do_not_duplicate_with": ["C01", "C02", "C05", "C15", "C20", "C25"],
+      "notes": "Conservative JD-only LLM chunk.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C14",
+      "category": "culture",
+      "polarity": "positive",
+      "weight": 0.35,
+      "importance_tier": "4",
+      "bm25_query": "async first writing open disagreement decide quickly written reasoning documentation design docs RFCs memos communication remote collaboration",
+      "vector_query": "Works async-first, writes clearly in docs or RFCs, reasons in writing, collaborates remotely, and decides quickly.",
+      "expanded_text": "The candidate communicates complex technical tradeoffs clearly through asynchronous writing, RFCs, and design documents.",
+      "terms": [
+        "async-first",
+        "writing",
+        "open disagreement",
+        "quick decisions",
+        "written reasoning"
+      ],
+      "do_not_duplicate_with": ["C09", "C10", "C12", "C25"],
+      "notes": "Communication and decision style only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C15",
+      "category": "nice_to_have",
+      "polarity": "positive",
+      "weight": 0.45,
+      "importance_tier": "5",
+      "bm25_query": "LLM fine tuning LoRA QLoRA PEFT instruction adapters transformers HuggingFace TRL SFT supervised",
+      "vector_query": "Has LLM fine-tuning or instruction-tuning experience with LoRA, QLoRA, PEFT, adapters, HuggingFace transformers, or SFT.",
+      "expanded_text": "The candidate fine-tunes large language models using parameter-efficient methods like LoRA, QLoRA, or PEFT.",
+      "terms": [
+        "LLM fine-tuning",
+        "LoRA",
+        "QLoRA",
+        "PEFT",
+        "parameter-efficient fine-tuning"
+      ],
+      "do_not_duplicate_with": ["C13", "C25"],
+      "notes": "Bonus skill only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C16",
+      "category": "nice_to_have",
+      "polarity": "positive",
+      "weight": 0.5,
+      "importance_tier": "5",
+      "bm25_query": "learning to rank XGBoost LightGBM neural ranker model LambdaMART LambdaRank RankNet pairwise pointwise listwise features",
+      "vector_query": "Has learning-to-rank model experience using LambdaMART, RankNet, XGBoost, LightGBM, neural rankers, and pairwise or listwise objectives.",
+      "expanded_text": "The candidate applies classical machine learning models, such as XGBoost or LightGBM, to learning-to-rank problems.",
+      "terms": [
+        "learning-to-rank",
+        "XGBoost",
+        "LightGBM",
+        "neural ranker",
+        "ranking model"
+      ],
+      "do_not_duplicate_with": ["C05", "C06", "C25"],
+      "notes": "Bonus modeling signal.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C17",
+      "category": "nice_to_have",
+      "polarity": "positive",
+      "weight": 0.45,
+      "importance_tier": "5",
+      "bm25_query": "distributed systems large scale inference optimization latency throughput GPU batching quantization ONNX TensorRT vLLM serving caching autoscaling",
+      "vector_query": "Has large-scale inference optimization background covering latency, throughput, batching, GPU serving, quantization, ONNX, TensorRT, and vLLM.",
+      "expanded_text": "The candidate optimizes large-scale distributed systems and inference engines for latency, throughput, and GPU serving.",
+      "terms": [
+        "distributed systems",
+        "large-scale inference",
+        "inference optimization",
+        "latency",
+        "throughput",
+        "serving"
+      ],
+      "do_not_duplicate_with": ["C04", "C09", "C25"],
+      "notes": "Bonus infrastructure depth.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C18",
+      "category": "nice_to_have",
+      "polarity": "positive",
+      "weight": 0.4,
+      "importance_tier": "4",
+      "bm25_query": "AI ML open source papers talks visible technical work external validation GitHub publications blogs conference workshops Kaggle writing artifacts",
+      "vector_query": "Has positive external validation through visible AI or ML technical work like open-source contributions, papers, talks, or GitHub projects.",
+      "expanded_text": "The candidate has a visible track record of external technical validation, such as open-source contributions, academic papers, or conference talks.",
+      "terms": [
+        "open-source",
+        "papers",
+        "talks",
+        "visible technical work",
+        "external validation",
+        "public artifacts"
+      ],
+      "do_not_duplicate_with": ["C23", "C25"],
+      "notes": "Positive external-validation signal only.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C19",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 1.0,
+      "importance_tier": "10",
+      "bm25_query": "pure research academic lab thesis coursework benchmark",
+      "vector_query": "Has a pure research, academic lab, thesis, or benchmark-only profile completely lacking production software deployment.",
+      "expanded_text": "Negative evidence that the candidate's experience is STRICTLY limited to pure research, academic labs, or coursework without ANY production software deployment.",
+      "terms": [
+        "pure research",
+        "academic-only",
+        "research-only",
+        "no production deployment",
+        "thesis",
+        "coursework",
+        "benchmark-only"
+      ],
+      "do_not_duplicate_with": ["C05", "C10", "C25"],
+      "notes": "Explicit JD disqualifier focused on lack of production deployment.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C20",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 1.0,
+      "importance_tier": "10",
+      "bm25_query": "LangChain OpenAI wrapper prompt engineering chatbot demo boilerplate API",
+      "vector_query": "Builds basic prompt engineering, chatbot demos, and wrapper-only AI features without deeper retrieval or ranking infrastructure.",
+      "expanded_text": "Negative evidence that the candidate's ENTIRE artificial intelligence experience consists of basic wrappers, prompt engineering, or LangChain tutorials without deep retrieval infrastructure.",
+      "terms": [
+        "LangChain",
+        "OpenAI wrapper",
+        "wrapper-only",
+        "shallow API calling",
+        "no retrieval depth",
+        "no ranking depth"
+      ],
+      "do_not_duplicate_with": ["C02", "C13", "C24", "C25"],
+      "notes": "Explicit JD disqualifier for wrapper-heavy AI profiles.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C21",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 0.95,
+      "importance_tier": "9",
+      "bm25_query": "senior architect tech lead hands off",
+      "vector_query": "Works as a hands-off manager, pure architect, or director who no longer writes code or builds ML systems directly.",
+      "expanded_text": "Negative evidence that the candidate is EXCLUSIVELY a hands-off manager or architect who no longer writes production code.",
+      "terms": [
+        "no recent production code",
+        "hands-off architect",
+        "tech lead only",
+        "not hands-on",
+        "coding gap"
+      ],
+      "do_not_duplicate_with": ["C08", "C25"],
+      "notes": "Explicit JD risk because this role requires writing code.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C22",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 0.85,
+      "importance_tier": "8",
+      "bm25_query": "computer vision speech robotics",
+      "vector_query": "Focuses technical expertise entirely on computer vision, speech, or robotics without any NLP, information retrieval, or ranking exposure.",
+      "expanded_text": "Negative evidence that the candidate's technical expertise is ENTIRELY focused on computer vision, speech, or robotics, with absolutely no NLP or search experience.",
+      "terms": [
+        "computer vision",
+        "speech",
+        "robotics",
+        "no NLP",
+        "no IR",
+        "no retrieval exposure"
+      ],
+      "do_not_duplicate_with": ["C01", "C02", "C05", "C25"],
+      "notes": "Explicit JD domain mismatch.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C23",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 0.50,
+      "importance_tier": "7",
+      "bm25_query": "closed source proprietary systems outsourcing consulting services",
+      "vector_query": "Works exclusively in IT Services, Consulting, or outsourcing firms on closed-source proprietary systems.",
+      "expanded_text": "Negative evidence that the candidate works EXCLUSIVELY in IT Services, consulting, or outsourcing without core product-company experience.",
+      "terms": [
+        "closed-source-only",
+        "proprietary systems",
+        "no external validation",
+        "no papers",
+        "no talks",
+        "no visible artifacts"
+      ],
+      "do_not_duplicate_with": ["C18", "C25"],
+      "notes": "Negative counterpart to C18.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C24",
+      "category": "trap",
+      "polarity": "negative",
+      "weight": 0.8,
+      "importance_tier": "8",
+      "bm25_query": "framework enthusiast tutorials demos hot toy projects proof of concept PoC notebook Streamlit",
+      "vector_query": "Builds framework tutorials, toy projects, notebooks, and Streamlit demos without production systems thinking or architecture depth.",
+      "expanded_text": "Negative evidence that the candidate's portfolio consists ENTIRELY of toy projects, bootcamp tutorials, or basic demos lacking production-grade engineering.",
+      "terms": [
+        "framework enthusiast",
+        "tutorials",
+        "demos",
+        "hot framework",
+        "no systems thinking",
+        "demo-only"
+      ],
+      "do_not_duplicate_with": ["C09", "C20", "C25"],
+      "notes": "Explicit JD disqualifier.",
+      "source_type": "jd_text_only"
+    },
+    {
+      "id": "C25",
+      "category": "ideal_profile",
+      "polarity": "positive",
+      "weight": 0.0,
+      "importance_tier": "1",
+      "bm25_query": "informational ideal candidate summary do not score",
+      "vector_query": "informational-only summary of the ideal Redrob AI candidate",
+      "expanded_text": "Informational-only ideal candidate summary: applied ML engineer with production retrieval, ranking, evaluation, matching, product-engineering, ownership, and recruiter-workflow judgment. This chunk is for inspection only and must never affect retrieval or ranking scores.",
+      "terms": [
+        "ideal candidate summary",
+        "inspection only",
+        "do not score",
+        "informational"
+      ],
+      "do_not_duplicate_with": [
+        "C01", "C02", "C03", "C04", "C05", "C06", "C07", "C08",
+        "C09", "C10", "C11", "C12", "C13", "C14", "C15", "C16",
+        "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C24"
+      ],
+      "notes": "Weight is zero by design; exclude from BM25, vector retrieval, cross-encoder scoring, and aggregate scoring.",
+      "source_type": "jd_text_only"
+    }
+  ],
+  "routing_rules": {
+    "bm25": [
+      "Use chunk weights to scale lexical retrieval importance for C01 through C24 only.",
+      "Exclude C25 from BM25 retrieval because it is informational and has weight 0.0.",
+      "Aggregate chunk-level BM25 scores without double counting overlapping evidence listed in do_not_duplicate_with.",
+      "Route direct candidate-key and Redrob-signal features to the structured scoring layer, not this JD index."
+    ],
+    "vector": [
+      "Use chunk weights to scale semantic similarity importance for C01 through C24 only.",
+      "Exclude C25 from vector retrieval because it is informational and has weight 0.0.",
+      "Compare chunks only against candidate narrative text such as headline, summary, and career descriptions.",
+      "Aggregate chunk similarities with deduplication so one piece of evidence cannot satisfy multiple overlapping chunks."
+    ],
+    "dedupe": [
+      "C01 is role intent only, C05 is shipped end-to-end proof only, and C13 is LLM reranking or LLM pipeline integration only.",
+      "C06 is ranking metric literacy, while C07 is experimentation, offline-online correlation, and recruiter-feedback infrastructure.",
+      "C09 is systems architecture, C10 is shipper behavior, C12 is ambiguity ownership, and C14 is async writing and decision style.",
+      "C18 rewards visible external validation, while C23 penalizes closed-source-only work without external proof.",
+      "For overlapping chunks that share the same evidence, compute overlap_adjusted as 1.0 times the strongest matching score plus 0.5 times the second matching score plus 0.25 times the third matching score, then ignore any further duplicate matches."
+    ],
+    "negative_scoring": [
+      "Negative chunks C19 through C24 use weight as penalty magnitude controlled by polarity.",
+      "Apply each negative concept at most once even if multiple lexical forms match.",
+      "Do not use structured career-history or platform-activity features as evidence for these JD chunks."
+    ]
+  }
+}

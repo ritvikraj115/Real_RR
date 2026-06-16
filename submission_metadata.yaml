@@ -1,0 +1,46 @@
+# Redrob Hackathon — Submission Metadata
+# Fill this in before uploading.
+# Keep the values consistent with your actual submission.
+
+team_name: "Real_RR"
+
+primary_contact:
+  name: "RITVIK RAJ"
+  email: "ritvikraj.ipl@gmail.com"
+  phone: "+91-7488033541"
+
+team_members:
+  - name: "RITVIK RAJ"
+    email: "ritvikraj.ipl@gmail.com"
+    role: "Team Lead"
+
+github_repo: "https://github.com/YOUR_USERNAME/YOUR_REPO"
+sandbox_link: "https://YOUR-SANDBOX-LINK"
+reproduce_command: "python rank.py --candidates ./candidates.jsonl.gz --out ./submission.csv"
+
+compute:
+  platform: "Vstudio Code"
+  cpu_cores: 8
+  ram_gb: 16
+  python_version: "3.11.x"
+  os: "Windows"
+  uses_gpu_for_inference: false
+  has_network_during_ranking: false
+  pre_computation_required: true
+  pre_computation_time_minutes: 0
+
+ai_tools_used:
+  - "ChatGPT"
+
+ai_usage_summary: |
+  Used AI assistance for architecture discussion, code review, and debugging.
+
+methodology_summary: |
+  Hybrid candidate ranking system with conservative L0 triage, BM25 retrieval,
+  vector retrieval, cross-encoder reranking, and behavior-aware final scoring.
+
+declarations:
+  read_submission_spec: true
+  code_is_original_work: true
+  no_collusion: true
+  honeypot_aware: true
