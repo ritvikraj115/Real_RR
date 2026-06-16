@@ -83,10 +83,11 @@ These are local speedups. Candidate-level caches are intentionally not the focus
 
 - `rank_candidates.py` — full ranking pipeline
 - `validate_submission.py` — CSV validator
-- `requirements-ranker.txt` — dependencies
+- `requirements.txt` — dependencies
 - `submission_metadata.yaml` — submission metadata
 - `README.md` — setup and usage
 - `cache/` — local cache directory
+- `models/` — caching embedding models
 
 ## Typical commands
 
