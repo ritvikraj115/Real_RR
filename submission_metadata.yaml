@@ -33,7 +33,7 @@ ai_tools_used:
   - "ChatGPT"
 
 ai_usage_summary: |
-  Used AI assistance for architecture discussion, code review, and debugging.
+  Used AI assistance for architecture discussion, code generation and review, and debugging.
 
 methodology_summary: |
   This project implements a production-inspired, multi-stage candidate ranking

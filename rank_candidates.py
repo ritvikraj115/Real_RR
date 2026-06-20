@@ -1479,7 +1479,6 @@ def evaluate_l0_hard_drop_reasons(
     return reasons
 
 
-
 def apply_l0_triage(
     candidates: list[dict[str, Any]],
     as_of_date: date,
@@ -1520,113 +1519,113 @@ def apply_l0_triage(
             discarded.append({"candidate_id": cand_id, "reason": "; ".join(hard_drop_reasons)})
             continue
 
-        raw_bvs = 0.5
+        raw_bvs = 0.50
         strengths: list[str] = []
         penalties: list[str] = []
+
+        # Tier constants for a symmetric, readable BVS framework.
+        TIER3_EXCEPTIONAL_GREEN = 0.18   # strongest positive signals
+        TIER3_STRONG_GREEN = 0.15        # very strong positives
+        TIER2_GREEN = 0.08               # solid positives
+        TIER1_GREEN = 0.03               # mild positives
+        TIER2_MAJOR_WARNING = -0.18      # major warnings
+        TIER1_FATAL_RED = -0.35          # severe soft penalty, not hard drop
+        TIER1_SMALL_WARNING = -0.08      # mild-to-moderate warnings
+
+        def add_strength(delta: float, reason: str) -> None:
+            nonlocal raw_bvs
+            raw_bvs += delta
+            strengths.append(reason)
+
+        def add_penalty(delta: float, reason: str) -> None:
+            nonlocal raw_bvs
+            raw_bvs += delta
+            penalties.append(reason)
 
         # Geography / relocation fit
         if "india" not in country:
             if not willing_relocate and country:
-                raw_bvs -= 0.25
-                penalties.append("geography_mismatch")
+                add_penalty(TIER2_MAJOR_WARNING, "geography_mismatch")
         else:
             if any(city in location for city in PRIMARY_CITIES):
-                raw_bvs += 0.12
-                strengths.append(f"location={location or country}")
+                add_strength(TIER3_EXCEPTIONAL_GREEN, f"location={location or country}")
             elif any(city in location for city in WELCOME_CITIES):
-                raw_bvs += 0.06
-                strengths.append(f"location={location or country}")
+                add_strength(TIER2_GREEN, f"location={location or country}")
             elif willing_relocate:
-                raw_bvs += 0.06
-                strengths.append("willing_to_relocate")
+                add_strength(TIER2_GREEN, "willing_to_relocate")
 
         # Experience band
         if 6.0 <= yoe <= 8.0:
-            raw_bvs += 0.12
-            strengths.append(f"target_yoe={yoe:.1f}")
+            add_strength(TIER3_EXCEPTIONAL_GREEN, f"target_yoe={yoe:.1f}")
         elif 5.0 <= yoe < 6.0 or 8.0 < yoe <= 9.0:
-            raw_bvs += 0.07
-            strengths.append(f"acceptable_yoe={yoe:.1f}")
+            add_strength(TIER2_GREEN, f"acceptable_yoe={yoe:.1f}")
         elif 4.0 <= yoe < 5.0 or 9.0 < yoe <= 11.0:
-            raw_bvs += 0.03
+            add_strength(TIER1_GREEN, f"near_band_yoe={yoe:.1f}")
+        elif yoe < 3.0 or yoe > 12.0:
+            add_penalty(TIER1_FATAL_RED, f"outside_jd_band={yoe:.1f}")
         else:
-            raw_bvs -= 0.05
-            penalties.append(f"outside_jd_band={yoe:.1f}")
+            add_penalty(TIER2_MAJOR_WARNING, f"outside_jd_band={yoe:.1f}")
 
         # Availability / activity
         if signals.get("open_to_work_flag"):
-            raw_bvs += 0.08
-            strengths.append("open_to_work")
+            add_strength(TIER3_STRONG_GREEN, "open_to_work")
 
         if signup_date:
             signup_days = max(0, (as_of_date - signup_date).days)
             if signup_days <= 365:
-                raw_bvs += 0.06
-                strengths.append("recent_platform_signup")
+                add_strength(TIER1_GREEN, "recent_platform_signup")
             elif signup_days <= 3650:
-                raw_bvs += 0.03
+                add_strength(0.02, "established_platform_history")
 
         if last_active:
             days_inactive = max(0, (as_of_date - last_active).days)
             if days_inactive <= 14:
-                raw_bvs += 0.10
-                strengths.append("very_recent_activity")
+                add_strength(TIER3_STRONG_GREEN, "very_recent_activity")
             elif days_inactive <= 30:
-                raw_bvs += 0.10
-                strengths.append("recent_activity")
+                add_strength(TIER2_GREEN, "recent_activity")
             elif days_inactive <= 90:
-                raw_bvs += 0.06
+                add_strength(TIER1_GREEN, "moderate_activity")
             elif days_inactive <= 180:
-                raw_bvs -= 0.05
+                add_penalty(TIER1_SMALL_WARNING, "aging_activity")
             else:
-                raw_bvs -= 0.12
-                penalties.append("stale_activity")
+                add_penalty(TIER2_MAJOR_WARNING, "stale_activity")
 
         if recruiter_response_rate >= 0.80:
-            raw_bvs += 0.10
-            strengths.append(f"recruiter_response_rate={recruiter_response_rate:.2f}")
+            add_strength(TIER3_EXCEPTIONAL_GREEN, f"recruiter_response_rate={recruiter_response_rate:.2f}")
         elif recruiter_response_rate >= 0.60:
-            raw_bvs += 0.06
+            add_strength(TIER2_GREEN, f"recruiter_response_rate={recruiter_response_rate:.2f}")
         elif recruiter_response_rate < 0.20:
-            raw_bvs -= 0.08
-            penalties.append(f"low_recruiter_response_rate={recruiter_response_rate:.2f}")
+            add_penalty(TIER2_MAJOR_WARNING, f"low_recruiter_response_rate={recruiter_response_rate:.2f}")
 
         if avg_response_hours <= 24:
-            raw_bvs += 0.06
-            strengths.append(f"avg_response_time={avg_response_hours:.1f}h")
+            add_strength(TIER3_EXCEPTIONAL_GREEN, f"avg_response_time={avg_response_hours:.1f}h")
         elif avg_response_hours <= 72:
-            raw_bvs += 0.03
+            add_strength(TIER2_GREEN, f"avg_response_time={avg_response_hours:.1f}h")
         elif avg_response_hours > 168:
-            raw_bvs -= 0.08
-            penalties.append(f"slow_response={avg_response_hours:.1f}h")
+            add_penalty(TIER2_MAJOR_WARNING, f"slow_response={avg_response_hours:.1f}h")
 
         if notice_days <= 15 and notice_days > 0:
-            raw_bvs += 0.06
-            strengths.append(f"notice_period={notice_days}d")
+            add_strength(TIER1_GREEN, f"notice_period={notice_days}d")
         elif notice_days <= 30 and notice_days > 15:
-            raw_bvs += 0.04
-            strengths.append(f"notice_period={notice_days}d")
+            add_strength(TIER1_GREEN, f"notice_period={notice_days}d")
         elif 30 < notice_days <= 60:
-            raw_bvs -= 0.04
-            penalties.append(f"notice_period={notice_days}d")
+            add_penalty(TIER1_SMALL_WARNING, f"notice_period={notice_days}d")
         elif 60 < notice_days <= 90:
-            raw_bvs -= 0.10
-            penalties.append(f"notice_period={notice_days}d")
+            add_penalty(TIER2_MAJOR_WARNING, f"notice_period={notice_days}d")
         elif notice_days > 90:
-            raw_bvs -= 0.20
-            penalties.append(f"notice_period={notice_days}d")
+            add_penalty(TIER2_MAJOR_WARNING, f"notice_period={notice_days}d")
 
         if as_int(signals.get("applications_submitted_30d"), 0) > 3:
-            raw_bvs += 0.03
-            strengths.append("active_applications")
+            add_strength(TIER1_GREEN, "active_applications")
 
         views_30d = as_int(signals.get("profile_views_received_30d"), 0)
         search_appearance_30d = as_int(signals.get("search_appearance_30d"), 0)
         saved_by_recruiters_30d = as_int(signals.get("saved_by_recruiters_30d"), 0)
         connections = as_int(signals.get("connection_count"), 0)
         endorsements = as_int(signals.get("endorsements_received"), 0)
+
         if views_30d > 50 or search_appearance_30d > 50 or saved_by_recruiters_30d > 2 or connections > 100:
-            raw_bvs += 0.06
+            add_strength(TIER1_GREEN, "market_interest")
             if views_30d > 50:
                 strengths.append(f"profile_views_30d={views_30d}")
             if search_appearance_30d > 50:
@@ -1635,27 +1634,27 @@ def apply_l0_triage(
                 strengths.append(f"saved_by_recruiters_30d={saved_by_recruiters_30d}")
             if connections > 100:
                 strengths.append(f"connection_count={connections}")
+
         if endorsements > 10:
-            raw_bvs += 0.06
-            strengths.append(f"endorsements_received={endorsements}")
+            add_strength(TIER1_GREEN, f"endorsements_received={endorsements}")
 
         offer_rate = as_float(signals.get("offer_acceptance_rate"), -1.0)
         if offer_rate > 0.60:
-            raw_bvs += 0.06
-            strengths.append(f"offer_acceptance_rate={offer_rate:.2f}")
+            add_strength(TIER2_GREEN, f"offer_acceptance_rate={offer_rate:.2f}")
 
         interview_rate = as_float(signals.get("interview_completion_rate"), -1.0)
-        if interview_rate > 0.80:
-            raw_bvs += 0.06
-            strengths.append(f"interview_completion_rate={interview_rate:.2f}")
+        if interview_rate >= 0.85:
+            add_strength(TIER3_EXCEPTIONAL_GREEN, f"interview_completion_rate={interview_rate:.2f}")
+        elif interview_rate > 0.70:
+            add_strength(TIER2_GREEN, f"interview_completion_rate={interview_rate:.2f}")
+        elif 0.0 <= interview_rate < 0.45:
+            add_penalty(TIER2_MAJOR_WARNING, f"low_interview_completion_rate={interview_rate:.2f}")
 
         if profile_completeness > 80:
-            raw_bvs += 0.06
-            strengths.append(f"profile_completeness={profile_completeness:.1f}")
+            add_strength(TIER1_GREEN, f"profile_completeness={profile_completeness:.1f}")
 
         if bool(signals.get("verified_email")) and bool(signals.get("verified_phone")) and bool(signals.get("linkedin_connected")):
-            raw_bvs += 0.06
-            strengths.append("all_verifications_complete")
+            add_strength(TIER1_GREEN, "all_verifications_complete")
 
         assessments = signals.get("skill_assessment_scores") or {}
         relevant_assessment_scores: list[float] = []
@@ -1666,47 +1665,49 @@ def apply_l0_triage(
             skill_l = str(skill_name).lower()
             if any(term in skill_l for term in RELEVANT_SKILL_TERMS):
                 relevant_assessment_scores.append(score)
+
         if relevant_assessment_scores:
             avg_relevant = sum(relevant_assessment_scores) / len(relevant_assessment_scores)
         elif fallback_assessment_scores:
             avg_relevant = sum(fallback_assessment_scores) / len(fallback_assessment_scores)
         else:
             avg_relevant = 0.35
+
         if avg_relevant >= 0.85:
-            raw_bvs += 0.12
-            strengths.append(f"high_assessment_avg={avg_relevant:.2f}")
+            add_strength(TIER3_EXCEPTIONAL_GREEN, f"high_assessment_avg={avg_relevant:.2f}")
         elif avg_relevant >= 0.65:
-            raw_bvs += 0.06
+            add_strength(TIER2_GREEN, f"assessment_avg={avg_relevant:.2f}")
         elif avg_relevant < 0.45:
-            raw_bvs -= 0.05
-            penalties.append(f"low_assessment_avg={avg_relevant:.2f}")
+            add_penalty(TIER1_FATAL_RED, f"low_assessment_avg={avg_relevant:.2f}")
 
         github_score = as_float(signals.get("github_activity_score"), 0.0)
         if github_score > 50:
-            raw_bvs += 0.10
-            strengths.append(f"high_github_activity={github_score:.1f}")
+            add_strength(TIER2_GREEN, f"high_github_activity={github_score:.1f}")
         elif github_score < 0:
-            raw_bvs -= 0.05
+            add_penalty(TIER1_SMALL_WARNING, "missing_github_activity")
 
-        role_durations = [as_int(role.get("duration_months"), 0) for role in history if as_int(role.get("duration_months"), 0) > 0]
+        role_durations = [
+            as_int(role.get("duration_months"), 0)
+            for role in history
+            if as_int(role.get("duration_months"), 0) > 0
+        ]
         sorted_history = sorted(
             enumerate(history),
             key=lambda item: (parse_date(item[1].get("start_date")) or date.min, item[0]),
         )
 
         if history and any(str(role.get("company_size") or "") in ("11-50", "51-200") for role in history):
-            raw_bvs += 0.08
-            strengths.append("startup_exposure")
+            add_strength(TIER1_GREEN, "startup_exposure")
 
         if history and all(str(role.get("company_size") or "") == "10001+" for role in history):
-            raw_bvs -= 0.05
-            penalties.append("big_tech_only")
+            add_penalty(TIER1_SMALL_WARNING, "big_tech_only")
 
         if len(role_durations) >= 3:
             median_duration = float(np.median(np.asarray(role_durations, dtype=np.float32)))
-            if median_duration < 18:
-                raw_bvs -= 0.12
-                penalties.append(f"job_hopping_median={median_duration:.1f}mo")
+            if median_duration < 12:
+                add_penalty(TIER2_MAJOR_WARNING, f"job_hopping_median={median_duration:.1f}mo")
+            elif median_duration < 18:
+                add_penalty(TIER1_SMALL_WARNING, f"job_hopping_median={median_duration:.1f}mo")
 
         if len(sorted_history) >= 2:
             recent_two = [
@@ -1715,25 +1716,23 @@ def apply_l0_triage(
             ]
             if all(duration > 0 for duration in recent_two):
                 recent_avg = sum(recent_two) / 2.0
-                if recent_avg < 18:
-                    raw_bvs -= 0.10
-                    penalties.append(f"job_hopping_recent_avg={recent_avg:.1f}mo")
+                if recent_avg < 12:
+                    add_penalty(TIER2_MAJOR_WARNING, f"job_hopping_recent_avg={recent_avg:.1f}mo")
+                elif recent_avg < 18:
+                    add_penalty(TIER1_SMALL_WARNING, f"job_hopping_recent_avg={recent_avg:.1f}mo")
 
         if current_industry and current_industry not in ["it services", "consulting"]:
-            raw_bvs += 0.06
-            strengths.append(f"product_industry={current_industry}")
+            add_strength(TIER1_GREEN, f"product_industry={current_industry}")
             if any(domain in current_industry for domain in ["hr", "recruiting", "marketplace", "talent"]):
-                raw_bvs += 0.06
-                strengths.append("hr_marketplace_domain_expert")
+                add_strength(TIER2_GREEN, "hr_marketplace_domain_expert")
 
         title_mismatch_terms = ("marketing", "sales", "hr", "recruiter", "people ops", "ops")
         tech_title_terms = ("engineer", "scientist", "ml", "ai", "search", "ranking", "retrieval", "nlp", "data")
         if current_title and any(term in current_title for term in title_mismatch_terms) and not any(term in current_title for term in tech_title_terms):
-            raw_bvs -= 0.12
-            penalties.append("title_skill_mismatch")
+            add_penalty(TIER2_MAJOR_WARNING, "title_skill_mismatch")
 
         if 5.0 <= yoe <= 9.0:
-            raw_bvs += 0.03
+            add_strength(TIER1_GREEN, "experience_in_band")
 
         # Queue candidate for the second, text-aware pass only if the cheap structured
         # signals are promising enough.
@@ -1781,22 +1780,22 @@ def apply_l0_triage(
                 raw_bvs += 0.03
                 strengths.append("production_evidence")
             if text_has_any(narrative_text, research_terms) and not text_has_any(narrative_text, production_terms):
-                raw_bvs -= 0.12
+                raw_bvs -= 0.18
                 penalties.append("research_only_like")
             if text_has_any(narrative_text, wrapper_terms) and not text_has_any(narrative_text, retrieval_terms):
-                raw_bvs -= 0.15
+                raw_bvs -= 0.20
                 penalties.append("wrapper_only_like")
             if text_has_any(narrative_text, wrong_domain_terms) and not text_has_any(narrative_text, retrieval_terms):
-                raw_bvs -= 0.12
+                raw_bvs -= 0.18
                 penalties.append("wrong_domain_like")
             if text_has_any(narrative_text, ("framework", "frameworks", "notebook", "poc", "prototype", "tutorial", "demo")) and not text_has_any(narrative_text, systems_terms):
-                raw_bvs -= 0.10
+                raw_bvs -= 0.18
                 penalties.append("framework_demo_only_like")
 
             if text_has_any(narrative_text, ("owned", "led", "architected", "built from scratch", "end to end", "cross functional")):
-                raw_bvs += 0.03
+                raw_bvs += 0.08
                 strengths.append("narrative_ownership")
-
+        
         final_bvs = shape_bvs_score(clamp01(raw_bvs))
         if final_bvs < threshold:
             discarded.append({"candidate_id": cand_id, "reason": f"below_bvs_threshold={final_bvs:.3f}"})
@@ -1814,7 +1813,6 @@ def apply_l0_triage(
         bvs_scores.append(final_bvs)
 
     return surviving, np.asarray(bvs_scores, dtype=np.float32), discarded, threshold
-
 
 def load_candidates(
     path: Path,
@@ -2671,19 +2669,53 @@ def run(args: argparse.Namespace) -> int:
         ce_tech = float(cross_scores_shortlist[offset])
         semantic_boost = float(semantic_final_norm[cand_idx])
         behavior_boost = float(bvs_scores[cand_idx])
-        base_score = (0.70 * ce_tech) + (0.12 * semantic_boost) + (0.18 * behavior_boost)
+        
+        # 1. RE-BALANCE THE WEIGHTS
+        # Shift 10% from the CE to BVS to give behavior real teeth at the top of the funnel.
+        base_score = (0.60 * ce_tech) + (0.10 * semantic_boost) + (0.30 * behavior_boost)
 
         adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
         coverage_bonus, family_count, _family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
         evidence_bonus, evidence_hits = evidence_density_bonus(adjusted_row, chunks)
-        negative_conf, _negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
+        
+        # 2. UNPACK THE SMART BREAKDOWN
+        # We stop ignoring the dictionary and pull the specific anti-signals out.
+        negative_conf, negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
 
         coverage_bonus *= 1.15
         evidence_bonus *= 1.15
 
+        # 3. SMART PENALTY CATEGORIZATION
+        wrapper_pen = negative_breakdown.get("wrapper", 0.0)
+        domain_pen = negative_breakdown.get("wrong_domain", 0.0)
+        research_pen = negative_breakdown.get("research", 0.0)
+        framework_pen = negative_breakdown.get("framework", 0.0)
+
+        smart_narrative_multiplier = 1.0
+        
+        # Tier 1 Fatal: OpenAI Wrappers & Langchain prompt-engineers. Suppress violently.
+        if wrapper_pen > 0.20:
+            smart_narrative_multiplier *= math.exp(-wrapper_pen * 4.5)  
+            
+        # Tier 2 Severe: Pure CV/Speech engineers applying for Search/Ranking roles.
+        if domain_pen > 0.20:
+            smart_narrative_multiplier *= math.exp(-domain_pen * 3.5)   
+            
+        # Tier 3 Moderate: Academic/Research heavy (missing production deployment).
+        if research_pen > 0.20:
+            smart_narrative_multiplier *= math.exp(-research_pen * 2.5) 
+            
+        # Tier 4 Mild: Built prototypes/POCs but lacks system architecture depth.
+        if framework_pen > 0.20:
+            smart_narrative_multiplier *= math.exp(-framework_pen * 1.5) 
+
+        # 4. INCREASE EXPLICIT CE PENALTY
+        # If the neural network specifically flagged negative chunks (C19-C24), hit them harder.
         ce_penalty = float(cross_neg_scores[offset])
         safe_penalty = ce_penalty if ce_penalty > 0.05 else 0.0
-        penalty_multiplier = math.exp(-safe_penalty * 2.0) * negative_confidence_penalty(negative_conf)
+        
+        # Combine the Cross-Encoder penalty (now 3.5x instead of 2.0x) with the Smart Category penalty
+        penalty_multiplier = math.exp(-safe_penalty * 3.5) * smart_narrative_multiplier
 
         final_scores[cand_idx] = (base_score + coverage_bonus + evidence_bonus) * penalty_multiplier
 
@@ -2799,8 +2831,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scores-output", default="", help="Optional per-candidate score CSV.")
     parser.add_argument("--chunk-scores-output", default="", help="Optional chunk score CSV for ranked candidates.")
     parser.add_argument("--chunk-scores-limit", type=int, default=1000, help="How many ranked candidates to include in chunk score export.")
-    parser.add_argument("--pre-shortlist-size", type=int, default=800, help="Candidates to send to Vector Search.")
-    parser.add_argument("--shortlist-size", type=int, default=120, help="Candidates to send to Cross Encoder.")
+    parser.add_argument("--pre-shortlist-size", type=int, default=1000, help="Candidates to send to Vector Search.")
+    parser.add_argument("--shortlist-size", type=int, default=150, help="Candidates to send to Cross Encoder.")
     parser.add_argument("--top-k", type=int, default=100, help="Top-K rows to write.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Optional cap for smoke tests.")
     parser.add_argument("--allow-fewer-than-top-k", action="store_true", help="Allow writing fewer than top_k rows for smoke tests.")
