@@ -13,7 +13,6 @@ Rather than relying on a single ranking signal, the system combines **structured
 ```text
 .
 ├── models/                         # Cached SentenceTransformer and Cross-Encoder models
-├── cache/                          # Local embedding and scoring caches
 ├── app.py                          # Optional Streamlit demonstration
 ├── jd_hybrid_index.json            # Preprocessed hybrid JD index
 ├── rank_candidates.py              # Main ranking pipeline
@@ -77,10 +76,7 @@ Before execution, place the dataset (for example `candidates.jsonl`) in the repo
 Run the ranking pipeline:
 
 ```bash
-python rank_candidates.py \
-    --candidates candidates.jsonl \
-    --jd-index jd_hybrid_index.json \
-    --output Real_RR.csv
+python rank_candidates.py --candidates candidates.jsonl --jd-index jd_hybrid_index.json --output Real_RR.csv
 ```
 
 Validate the generated submission:
