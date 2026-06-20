@@ -206,7 +206,7 @@ Candidate narratives and JD chunks are encoded using a Sentence Transformer Bi-E
 Semantic similarity is computed using cosine similarity:
 
 $$
-\operatorname{CosSim}(x,y)=\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
+\mathrm{CosSim}(x,y)=\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
 $$
 
 allowing semantically similar concepts to match even when different terminology is used.
@@ -250,17 +250,17 @@ $$
 
 where
 
-* (z) is the raw Cross-Encoder logit,
-* (b) is the median logit used for bias correction,
-* (T) is the calibration temperature,
-* (\sigma) denotes the sigmoid function.
+* \(z\) is the raw Cross-Encoder logit,
+* \(b\) is the median logit used for bias correction,
+* \(T\) is the calibration temperature,
+* \(\sigma\) denotes the sigmoid function.
 
 Only a single sigmoid transformation is applied.
 
 The strongest semantic evidence is then aggregated using a consistency-aware formulation:
 
 $$
-CE = 0.7\times\max(\text{Top3}) + 0.3\times\operatorname{mean}(\text{Top3})
+CE = 0.7\times\max(\text{Top3}) + 0.3\times\mathrm{mean}(\text{Top3})
 $$
 
 which rewards candidates demonstrating consistently strong evidence rather than relying on a single exceptional passage.
@@ -279,8 +279,8 @@ $$
 
 where
 
-* (Best_i) is the strongest semantic similarity observed for family (i),
-* (w_i) is the corresponding JD importance weight.
+* \(Best_i\) is the strongest semantic similarity observed for family \(i\),
+* \(w_i\) is the corresponding JD importance weight.
 
 This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
 
@@ -293,7 +293,7 @@ Evidence Density measures the consistency of supporting semantic evidence throug
 Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes:
 
 $$
-Evidence = 0.7\times\max(\text{Top3}) + 0.3\times\operatorname{mean}(\text{Top3})
+Evidence = 0.7\times\max(\text{Top3}) + 0.3\times\mathrm{mean}(\text{Top3})
 $$
 
 encouraging candidates who consistently demonstrate strong relevance across multiple supporting passages.
@@ -318,9 +318,9 @@ $$
 
 where
 
-* (CE_{adj}) is the confidence-calibrated Cross-Encoder score,
-* (BE) is the Bi-Encoder similarity,
-* (BM25) is the lexical relevance score.
+* \(CE_{adj}\) is the confidence-calibrated Cross-Encoder score,
+* \(BE\) is the Bi-Encoder similarity,
+* \(BM25\) is the lexical relevance score.
 
 The final ranking score combines:
 
