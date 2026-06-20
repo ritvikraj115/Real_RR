@@ -33,7 +33,7 @@ DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 JD_EMBEDDING_CACHE_VERSION = 2
 VECTOR_SCORE_CACHE_VERSION = 3
-CROSS_SCORE_CACHE_VERSION = 12
+CROSS_SCORE_CACHE_VERSION = 13
 BVS_MIN_THRESHOLD = 0.27
 
 # Chunk-family coverage controls
@@ -283,7 +283,7 @@ def percentile_rank(values: np.ndarray) -> np.ndarray:
 def stretch_bvs_percentile(rank_values: np.ndarray) -> np.ndarray:
     """Spread the BVS middle band gently while preserving separation at the top."""
     ranks = np.asarray(rank_values, dtype=np.float32)
-    stretched = sigmoid((ranks - 0.56) * 4.2)
+    stretched = sigmoid((ranks - 0.50) * 3.25)
     return np.clip(stretched, 0.0, 1.0).astype(np.float32)
 
 
@@ -292,10 +292,9 @@ def shape_bvs_score(raw_bvs: float) -> float:
     if math.isnan(raw_bvs) or math.isinf(raw_bvs):
         return 0.0
 
-    # Keep the middle band visible so BVS remains discriminative after calibration.
-    shaped = sigmoid((float(raw_bvs) - 0.55) * 2.80)
-    return clamp01(0.03 + 0.94 * shaped)
-
+    # Use a softer curve so the mid-band keeps meaningful spread.
+    shaped = sigmoid((float(raw_bvs) - 0.50) * 4.20)
+    return clamp01(0.02 + 0.96 * shaped)
 
 def as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -623,8 +622,11 @@ def select_family_covered_ce_chunks(
             candidate_pool = [idx for idx in bi_positive_pool if chunk_family(chunks[idx].id) == family_spec]
             if not candidate_pool:
                 candidate_pool = [idx for idx in positive_indices if chunk_family(chunks[idx].id) == family_spec]
+
         best_idx = take_best(candidate_pool)
         if best_idx is None:
+            continue
+        if positive_scores.get(best_idx, 0.0) < CROSS_ENCODER_POSITIVE_FLOOR:
             continue
         selected_positive.append(best_idx)
         selected_set.add(best_idx)
@@ -633,7 +635,7 @@ def select_family_covered_ce_chunks(
     if not wildcard_pool:
         wildcard_pool = [idx for idx in positive_indices if idx not in selected_set]
     best_wildcard = take_best(wildcard_pool)
-    if best_wildcard is not None:
+    if best_wildcard is not None and positive_scores.get(best_wildcard, 0.0) >= CROSS_ENCODER_POSITIVE_FLOOR:
         selected_positive.append(best_wildcard)
         selected_set.add(best_wildcard)
 
@@ -641,8 +643,10 @@ def select_family_covered_ce_chunks(
         ((score, idx) for idx, score in positive_scores.items() if idx not in selected_set),
         key=lambda item: (-item[0], chunks[item[1]].id),
     )
-    for _, idx in remaining_positive:
+    for score, idx in remaining_positive:
         if len(selected_positive) >= CROSS_ENCODER_MAX_POSITIVE_CHUNKS:
+            break
+        if score < CROSS_ENCODER_POSITIVE_FLOOR:
             break
         selected_positive.append(idx)
         selected_set.add(idx)
@@ -650,7 +654,7 @@ def select_family_covered_ce_chunks(
     positive_filled = list(dict.fromkeys(selected_positive))[:CROSS_ENCODER_MAX_POSITIVE_CHUNKS]
 
     negative_sorted = sorted(
-        ((score, idx) for idx, score in negative_scores.items()),
+        ((score, idx) for idx, score in negative_scores.items() if score >= CROSS_ENCODER_NEGATIVE_FLOOR),
         key=lambda item: (-item[0], chunks[item[1]].id),
     )
     ce_negative = [idx for _, idx in negative_sorted[:CROSS_ENCODER_MAX_NEGATIVE_CHUNKS]]
@@ -839,29 +843,65 @@ def extract_achievement_snippets(text: str, max_snippets: int = ACHIEVEMENT_SNIP
     return snippets
 
 
-def positive_family_coverage_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float, int, list[str]]:
+def positive_family_coverage_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float, float, list[str]]:
+    """Reward quality-weighted breadth across JD families without raw count bias."""
     families_hit: list[str] = []
+    weighted_quality_num = 0.0
+    weighted_quality_den = 0.0
+
     for family in POSITIVE_FAMILY_ORDER:
         indices = [idx for idx, chunk in enumerate(chunks) if chunk.polarity == "positive" and chunk_family(chunk.id) == family]
         if not indices:
             continue
-        family_peak = float(np.max(row[indices])) if indices else 0.0
-        if family_peak >= COVERAGE_SUPPORT_THRESHOLD:
-            families_hit.append(family)
-    bonus = min(COVERAGE_BONUS_MAX, max(0, len(families_hit) - 1) * 0.015)
-    return bonus, len(families_hit), families_hit
+        family_peak = max(float(row[idx]) for idx in indices)
+        if family_peak < COVERAGE_SUPPORT_THRESHOLD:
+            continue
+
+        family_importance = max(float(effective_chunk_weight(chunks[idx])) for idx in indices)
+        families_hit.append(family)
+        weighted_quality_num += family_peak * family_importance
+        weighted_quality_den += family_importance
+
+    if not families_hit or weighted_quality_den <= 0.0:
+        return 0.0, 0.0, []
+
+    quality = weighted_quality_num / weighted_quality_den
+    breadth = len(families_hit) / float(len(POSITIVE_FAMILY_ORDER))
+    combined = 0.80 * quality + 0.20 * breadth
+
+    # Smoothly map quality to the configured bonus range.
+    bonus = COVERAGE_BONUS_MAX * float(sigmoid((combined - 0.45) * 6.0))
+    return float(bonus), float(combined), families_hit
 
 
-def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float, int]:
-    positive_hits = 0
+def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float, float, int]:
+    """Reward consistently strong evidence rather than many mediocre hits."""
+    hits: list[tuple[float, float]] = []
+    positive_total = 0
+
     for idx, chunk in enumerate(chunks):
         if chunk.polarity != "positive":
             continue
-        if float(row[idx]) >= EVIDENCE_DENSITY_THRESHOLD:
-            positive_hits += 1
-    bonus = min(EVIDENCE_DENSITY_BONUS_MAX, max(0, positive_hits - 1) * 0.012)
-    return bonus, positive_hits
+        score = float(row[idx])
+        if score < EVIDENCE_DENSITY_THRESHOLD:
+            continue
+        positive_total += 1
+        hits.append((score, float(effective_chunk_weight(chunk))))
 
+    if not hits:
+        return 0.0, 0.0, 0
+
+    hits.sort(key=lambda item: item[0], reverse=True)
+    top_hits = hits[:5]
+    weighted_num = sum(score * weight for score, weight in top_hits)
+    weighted_den = sum(weight for _, weight in top_hits)
+    quality = weighted_num / max(weighted_den, 1e-6)
+    top3 = top_hits[:3]
+    top3_mean = float(np.mean([score for score, _ in top3])) if top3 else 0.0
+    combined = 0.80 * quality + 0.20 * top3_mean
+
+    bonus = EVIDENCE_DENSITY_BONUS_MAX * float(sigmoid((combined - 0.45) * 6.5))
+    return float(bonus), float(combined), positive_total
 
 
 def negative_confidence_details(text: str) -> tuple[float, dict[str, float]]:
@@ -869,6 +909,13 @@ def negative_confidence_details(text: str) -> tuple[float, dict[str, float]]:
     sentences = [s for s in (seg.strip() for seg in SENTENCE_RE.split(text)) if s]
     if not sentences:
         return 0.0, {"wrapper": 0.0, "research": 0.0, "framework": 0.0, "wrong_domain": 0.0}
+
+    family_weights = {
+        "wrapper": 1.00,
+        "research": 0.95,
+        "framework": 0.85,
+        "wrong_domain": 0.90,
+    }
 
     def sentence_negative_score(sentence_l: str, triggers: tuple[str, ...], blockers: tuple[str, ...]) -> float:
         trig = sum(1 for term in triggers if term in sentence_l)
@@ -878,18 +925,10 @@ def negative_confidence_details(text: str) -> tuple[float, dict[str, float]]:
         block = sum(1 for term in blockers if term in sentence_l)
         score = 0.28 + 0.18 * min(trig, 4) - 0.10 * min(block, 3)
 
-        # Penalize "only"/"solely" language more strongly because it indicates
-        # the negative family dominates the profile rather than being incidental.
         if any(term in sentence_l for term in ("only", "solely", "just", "primarily", "mostly")):
             score += 0.12
-
-        # Multi-trigger sentences are usually stronger anti-signals than a
-        # single casual mention.
         if trig >= 2:
             score += 0.10
-
-        # If the same sentence also carries clear production evidence, reduce
-        # the negative confidence so we do not over-penalize real builders.
         if any(term in sentence_l for term in ("production", "deployed", "shipped", "launched", "users", "live")):
             score -= 0.14
 
@@ -901,8 +940,6 @@ def negative_confidence_details(text: str) -> tuple[float, dict[str, float]]:
             if any(term in sentence_l for term in triggers):
                 score += weight
 
-        # Small extra reward for concrete impact statements, which usually mean
-        # the profile is not negative-dominant.
         if re.search(r"\b\d+(?:\.\d+)?\s*(?:%|x|ms|s|sec|secs|seconds|minutes|hours|days|day|weeks|month|months|million|billion|k|m)\b", sentence_l):
             score += 0.05
         return clamp01(score)
@@ -923,31 +960,32 @@ def negative_confidence_details(text: str) -> tuple[float, dict[str, float]]:
         )
 
     if family_scores:
-        ordered_family_scores = sorted(family_scores.values(), reverse=True)
-        negative_strength = ordered_family_scores[0]
-        if len(ordered_family_scores) > 1:
-            negative_strength += 0.60 * ordered_family_scores[1]
-        if len(ordered_family_scores) > 2:
-            negative_strength += 0.35 * ordered_family_scores[2]
+        weighted_num = 0.0
+        weighted_den = 0.0
+        ordered_family_scores = sorted(family_scores.items(), key=lambda item: item[1], reverse=True)
+        for label, score in ordered_family_scores:
+            if score <= 0.0:
+                continue
+            weight = family_weights.get(label, 1.0)
+            weighted_num += weight * score
+            weighted_den += weight
 
-        # Slightly reward sustained negative evidence across multiple sentences.
-        support_count = sum(1 for value in ordered_family_scores if value >= 0.35)
+        negative_strength = weighted_num / max(weighted_den, 1e-6)
+        support_count = sum(1 for _, value in ordered_family_scores if value >= 0.35)
         if support_count >= 2:
-            negative_strength += 0.10 * min(3, support_count - 1)
+            negative_strength *= 1.0 + 0.04 * min(3, support_count - 1)
     else:
         negative_strength = 0.0
 
-    # Normalize against positive narrative evidence so the score reflects
-    # dominance rather than just raw keyword presence.
-    negative_confidence = negative_strength / (negative_strength + positive_strength + 0.15)
+    negative_confidence = negative_strength / (negative_strength + positive_strength + 0.20)
     return float(clamp01(negative_confidence)), family_scores
+
 
 def negative_confidence_penalty(negative_confidence: float) -> float:
     negative_confidence = clamp01(negative_confidence)
     if negative_confidence <= NEGATIVE_CONFIDENCE_RELEASE:
         return 1.0
     return math.exp(-NEGATIVE_CONFIDENCE_PENALTY_SCALE * (negative_confidence - NEGATIVE_CONFIDENCE_RELEASE))
-
 
 def minmax_vector(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
@@ -1522,7 +1560,7 @@ def apply_l0_triage(
             discarded.append({"candidate_id": cand_id, "reason": "; ".join(hard_drop_reasons)})
             continue
 
-        raw_bvs = 0.50
+        raw_bvs = 0.40
         strengths: list[str] = []
         penalties: list[str] = []
 
@@ -2180,6 +2218,11 @@ def compute_cross_encoder_scores(
         plan = selection_plans.get(cand_idx)
         if plan is None:
             continue
+
+        selected_indices = list(dict.fromkeys(plan.ce_positive_indices + plan.ce_negative_indices))
+        if not selected_indices:
+            continue
+
         best_role_idx = best_role_indices_by_shortlist[shortlist_pos] if shortlist_pos < len(best_role_indices_by_shortlist) else -1
         candidate_texts = [text.strip() for text in candidates[cand_idx].candidate_texts if text and text.strip()]
         latest_role = candidate_texts[-1] if len(candidate_texts) > 1 else ""
@@ -2191,13 +2234,12 @@ def compute_cross_encoder_scores(
             best_matching_role,
             achievement_snippets=achievement_snippets,
         )
-        clean_text = ce_text.strip()[:1800]
+        clean_text = ce_text.strip()[:1600]
         if not clean_text:
             continue
         ce_text_lengths.append(len(clean_text))
         achievement_snippet_counts.append(len(achievement_snippets))
 
-        selected_indices = list(dict.fromkeys(plan.ce_positive_indices + plan.ce_negative_indices))
         for chunk_idx in selected_indices:
             chunk = chunks[chunk_idx]
             all_pairs.append((chunk.expanded_text, clean_text))
@@ -2254,13 +2296,32 @@ def compute_cross_encoder_scores(
 
     pos_cols = [idx for idx, chunk in enumerate(chunks) if chunk.polarity == "positive"]
     neg_cols = [idx for idx, chunk in enumerate(chunks) if chunk.polarity == "negative"]
-    pos_scores = cross_adjusted[:, pos_cols].sum(axis=1) if pos_cols else np.zeros(len(shortlist), dtype=np.float32)
-    neg_scores = cross_adjusted[:, neg_cols].sum(axis=1) if neg_cols else np.zeros(len(shortlist), dtype=np.float32)
 
-    pos_weight_sum = sum(c.weight for c in positive_chunks) or 1.0
-    neg_weight_sum = sum(c.weight for c in negative_chunks) or 1.0
-    pos_scores = pos_scores / pos_weight_sum
-    neg_scores = neg_scores / neg_weight_sum
+    pos_scores = np.zeros(len(shortlist), dtype=np.float32)
+    neg_scores = np.zeros(len(shortlist), dtype=np.float32)
+
+    pos_weights = np.asarray([effective_chunk_weight(chunks[idx]) for idx in pos_cols], dtype=np.float32) if pos_cols else np.zeros((0,), dtype=np.float32)
+    neg_weights = np.asarray([effective_chunk_weight(chunks[idx]) for idx in neg_cols], dtype=np.float32) if neg_cols else np.zeros((0,), dtype=np.float32)
+
+    for row_idx in range(len(shortlist)):
+        if pos_cols:
+            row = np.asarray(cross_adjusted[row_idx, pos_cols], dtype=np.float32)
+            if row.size:
+                order = np.argsort(-row, kind="mergesort")
+                top = order[:3]
+                top_scores = row[top]
+                max_score = float(top_scores[0]) if top_scores.size else 0.0
+                mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
+                pos_scores[row_idx] = float(clamp01(0.70 * max_score + 0.30 * mean_top))
+        if neg_cols:
+            row = np.asarray(cross_adjusted[row_idx, neg_cols], dtype=np.float32)
+            if row.size:
+                order = np.argsort(-row, kind="mergesort")
+                top = order[:2]
+                top_scores = row[top]
+                max_score = float(top_scores[0]) if top_scores.size else 0.0
+                mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
+                neg_scores[row_idx] = float(clamp01(0.70 * max_score + 0.30 * mean_top))
 
     return pos_scores, neg_scores, cross_adjusted, f"sentence_transformers_cross_encoder:{model_path}"
 
@@ -2494,8 +2555,8 @@ def run(args: argparse.Namespace) -> int:
     candidates, bvs_scores, discarded, l0_threshold = load_candidates(candidate_path, as_of, args.max_candidates)
     raw_bvs_scores = np.asarray(bvs_scores, dtype=np.float32)
     bvs_scores = (
-        0.70 * raw_bvs_scores
-        + 0.30 * stretch_bvs_percentile(percentile_rank(raw_bvs_scores))
+        0.78 * raw_bvs_scores
+        + 0.22 * stretch_bvs_percentile(percentile_rank(raw_bvs_scores))
     ).astype(np.float32)
     print(f"[ranker] L0 kept={len(candidates)} discarded={len(discarded)} threshold={l0_threshold:.3f}", file=sys.stderr)
 
@@ -2665,73 +2726,52 @@ def run(args: argparse.Namespace) -> int:
     for offset, cand_idx in enumerate(shortlist):
         cross_adjusted_full[cand_idx] = cross_adjusted_shortlist[offset]
 
+
     final_scores = np.full(len(candidates), -np.inf, dtype=np.float32)
     coverage_bonus_values: list[float] = []
     evidence_bonus_values: list[float] = []
     negative_conf_values: list[float] = []
     family_counts: list[int] = []
     positive_evidence_hits: list[int] = []
+    smart_multiplier_values: list[float] = []
+    ce_penalty_values: list[float] = []
 
     for offset, cand_idx in enumerate(shortlist):
         ce_tech = float(cross_scores_shortlist[offset])
         semantic_boost = float(semantic_final_norm[cand_idx])
         behavior_boost = float(bvs_scores[cand_idx])
-        
-        # 1. RE-BALANCE THE WEIGHTS
-        # Shift 10% from the CE to BVS to give behavior real teeth at the top of the funnel.
-        base_score = (0.60 * ce_tech) + (0.10 * semantic_boost) + (0.30 * behavior_boost)
 
         adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
-        coverage_bonus, family_count, _family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
-        evidence_bonus, evidence_hits = evidence_density_bonus(adjusted_row, chunks)
-        
-        # 2. UNPACK THE SMART BREAKDOWN
-        # We stop ignoring the dictionary and pull the specific anti-signals out.
+        coverage_bonus, coverage_quality, family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
+        evidence_bonus, evidence_quality, evidence_hits = evidence_density_bonus(adjusted_row, chunks)
+
         negative_conf, negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
 
-        coverage_bonus *= 1.15
-        evidence_bonus *= 1.15
+        # Smooth family/evidence confidence for CE only. Use quality signals,
+        # not raw family counts, to avoid score cliffs.
+        smart_multiplier = 0.90 + 0.10 * float(sigmoid((0.68 * coverage_quality + 0.32 * evidence_quality - 0.50) * 5.0))
 
-        # 3. SMART PENALTY CATEGORIZATION
-        wrapper_pen = clamp01(negative_breakdown.get("wrapper", 0.0))
-        domain_pen = clamp01(negative_breakdown.get("wrong_domain", 0.0))
-        research_pen = clamp01(negative_breakdown.get("research", 0.0))
-        framework_pen = clamp01(negative_breakdown.get("framework", 0.0))
+        # Apply the smart multiplier only to the Cross-Encoder contribution.
+        ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
+        ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
 
-        # Smooth category-aware penalty curve: no cliff at arbitrary thresholds.
-        # Stronger families still matter more, but each signal contributes continuously.
-        smart_penalty_strength = (
-            0.90 * wrapper_pen
-            + 0.70 * domain_pen
-            + 0.55 * research_pen
-            + 0.35 * framework_pen
-        )
+        # CE remains dominant; BM25/semantic and BVS refine the ranking.
+        base_score = (0.55 * ce_adjusted) + (0.25 * semantic_boost) + (0.20 * behavior_boost)
 
-        support_count = sum(
-            1 for value in (wrapper_pen, domain_pen, research_pen, framework_pen)
-            if value >= 0.10
-        )
-        if support_count >= 2:
-            smart_penalty_strength *= 1.0 + 0.06 * (support_count - 1)
+        # Keep coverage and evidence as genuine bonuses rather than a re-ranking cliff.
+        final_raw = base_score + coverage_bonus + evidence_bonus
 
-        smart_narrative_multiplier = math.exp(-1.8 * smart_penalty_strength)
-
-        # 4. INCREASE EXPLICIT CE PENALTY
-        # If the neural network specifically flagged negative chunks (C19-C24), hit them harder.
-        ce_penalty = float(cross_neg_scores[offset])
-        safe_penalty = ce_penalty if ce_penalty > 0.05 else 0.0
-
-        # Combine the Cross-Encoder penalty with the smooth narrative penalty.
-        penalty_multiplier = math.exp(-safe_penalty * 3.2) * smart_narrative_multiplier
-
-        final_scores[cand_idx] = (base_score + coverage_bonus + evidence_bonus) * penalty_multiplier
+        # Narrative negative confidence acts as a calibrated risk penalty.
+        narrative_penalty = negative_confidence_penalty(negative_conf)
+        final_scores[cand_idx] = final_raw * narrative_penalty
 
         coverage_bonus_values.append(coverage_bonus)
         evidence_bonus_values.append(evidence_bonus)
         negative_conf_values.append(negative_conf)
-        family_counts.append(family_count)
+        family_counts.append(len(family_hits))
         positive_evidence_hits.append(evidence_hits)
-
+        smart_multiplier_values.append(float(smart_multiplier))
+        ce_penalty_values.append(float(ce_risk_multiplier))
     if shortlist:
         coverage_avg = float(np.mean(np.asarray(coverage_bonus_values, dtype=np.float32)))
         evidence_avg = float(np.mean(np.asarray(evidence_bonus_values, dtype=np.float32)))
@@ -2762,6 +2802,7 @@ def run(args: argparse.Namespace) -> int:
             f"Only {len(ranked)} reranked candidates available; cannot write exactly {args.top_k}. "
             "Increase --shortlist-size or use --allow-fewer-than-top-k for smoke tests."
         )
+
     # --- DIAGNOSTIC TABLE GENERATION ---
     diagnostic_path = Path("diagnostic_top20.csv")
     with diagnostic_path.open("w", newline="", encoding="utf-8") as f:
@@ -2770,38 +2811,25 @@ def run(args: argparse.Namespace) -> int:
         ])
         writer.writeheader()
         for rank, cand_idx in enumerate(ranked[:20], 1):
-            # Find their position in the shortlist
             offset = shortlist.index(cand_idx) if cand_idx in shortlist else -1
-            
-            # Recalculate components (mirroring the loop)
+
             ce_tech = float(cross_scores_shortlist[offset]) if offset != -1 else 0.0
             semantic_boost = float(semantic_final_norm[cand_idx])
             behavior_boost = float(bvs_scores[cand_idx])
-            
+
             adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
-            coverage_bonus, _, _ = positive_family_coverage_bonus(adjusted_row, chunks)
-            evidence_bonus, _ = evidence_density_bonus(adjusted_row, chunks)
-            
-            _, negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
-            
-            coverage_bonus *= 1.15
-            evidence_bonus *= 1.15
-            
-            wrapper_pen = negative_breakdown.get("wrapper", 0.0)
-            domain_pen = negative_breakdown.get("wrong_domain", 0.0)
-            research_pen = negative_breakdown.get("research", 0.0)
-            framework_pen = negative_breakdown.get("framework", 0.0)
+            coverage_bonus, coverage_quality, family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
+            evidence_bonus, evidence_quality, evidence_hits = evidence_density_bonus(adjusted_row, chunks)
+            negative_conf, _ = negative_confidence_details(candidates[cand_idx].candidate_text)
 
-            smart_multiplier = 1.0
-            if wrapper_pen > 0.20: smart_multiplier *= math.exp(-wrapper_pen * 4.5)  
-            if domain_pen > 0.20: smart_multiplier *= math.exp(-domain_pen * 3.5)   
-            if research_pen > 0.20: smart_multiplier *= math.exp(-research_pen * 2.5) 
-            if framework_pen > 0.20: smart_multiplier *= math.exp(-framework_pen * 1.5) 
+            smart_multiplier = 0.90 + 0.10 * float(sigmoid((0.68 * coverage_quality + 0.32 * evidence_quality - 0.50) * 5.0))
 
-            ce_penalty = float(cross_neg_scores[offset]) if offset != -1 else 0.0
-            safe_penalty = ce_penalty if ce_penalty > 0.05 else 0.0
-            final_multiplier = math.exp(-safe_penalty * 3.5) * smart_multiplier
-            
+            ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4) if offset != -1 else 1.0
+            ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
+            base_score = (0.55 * ce_adjusted) + (0.25 * semantic_boost) + (0.20 * behavior_boost)
+            final_raw = base_score + coverage_bonus + evidence_bonus
+            final_value = float(final_raw * negative_confidence_penalty(negative_conf))
+
             writer.writerow({
                 "Rank": rank,
                 "Candidate_ID": candidates[cand_idx].candidate_id,
@@ -2810,8 +2838,8 @@ def run(args: argparse.Namespace) -> int:
                 "BVS": f"{behavior_boost:.4f}",
                 "Coverage": f"{coverage_bonus:.4f}",
                 "Density": f"{evidence_bonus:.4f}",
-                "Smart_Multiplier": f"{final_multiplier:.4f}",
-                "Final": f"{float(final_scores[cand_idx]):.4f}"
+                "Smart_Multiplier": f"{smart_multiplier:.4f}",
+                "Final": f"{final_value:.4f}"
             })
     print(f"[ranker] wrote {diagnostic_path} for manual inspection", file=sys.stderr)
     # -----------------------------------
@@ -2858,8 +2886,8 @@ def run(args: argparse.Namespace) -> int:
             "jd_embeddings_cache": str(jd_embeddings_cache),
             "final_weights": {
                 "first_pass_hybrid": "Behavior-aware: 0.64 * semantic_norm + 0.36 * bvs_score",
-                "cross_encoder_final": "Multiplicative: 0.70 * cross_encoder_base + 0.12 * semantic_boost + 0.18 * bvs_base",
-                "negative_penalty": "Multiplicative Veto: math.exp(-negative_score * 2.0)",
+                "cross_encoder_final": "CE-calibrated: 0.55 * (CE * smart_multiplier) + 0.25 * semantic_boost + 0.20 * bvs_base",
+                "negative_penalty": "Calibrated narrative risk penalty: negative_confidence_penalty(negative_conf)",
             },
             "overlap_control": "connected-components near-duplicate suppression using chunk similarity thresholds",
             "vector_backend": vector_backend,

@@ -1,110 +1,230 @@
-# Redrob Hackathon Ranker
-
-This repository contains our submission for the **Redrob Intelligent Candidate Discovery Challenge**.
-
-The project implements a production-inspired, multi-stage candidate ranking pipeline that combines structured eligibility filtering, hybrid retrieval, neural reranking, and recruiter-oriented behavioral signals to produce an explainable ranking of candidates for a given job description.
-
-The complete ranking pipeline is:
-
-**L0 Triage → Behavior Validation Score (BVS) → BM25 Retrieval → Dense Vector Retrieval → Cross-Encoder Reranking → Coverage & Evidence Scoring → Final Score Fusion**
-
----
-
-# Repository Structure
-
-```text
-.
-├── models/                         # Cached SentenceTransformer and Cross-Encoder models
-├── cache/                          # Local embedding and scoring caches
-├── app.py                          # Optional Streamlit demo
-├── jd_hybrid_index.json            # Preprocessed hybrid JD index
-├── rank_candidates.py              # Main ranking pipeline
-├── validate_submission.py          # Submission validator
-├── submission_metadata.yaml        # Challenge metadata
-├── requirements.txt                # Python dependencies
-├── README.md
-├── ranking_pipeline_README.md      # Detailed pipeline documentation
-└── final_all_scores_features.csv   # Optional analysis output
-```
-
----
-
-# Environment
-
-The pipeline was developed and tested using the following environment.
-
-| Component        | Version         |
-| ---------------- | --------------- |
-| Python           | **3.12.x**      |
-| Execution        | CPU Only        |
-| Operating System | Windows / Linux |
-| GPU              | Not Required    |
-
-> **Note**
->
-> This project was validated using **Python 3.12**. Some versions of `torch`, `sentence-transformers`, and related dependencies may behave differently on older Python versions. For reproducible results, we recommend running the project with **Python 3.12**.
-
----
-
-# Installation
-
-We recommend using a clean virtual environment.
-
-```bash
-# Create virtual environment (Python 3.12)
-python3.12 -m venv .venv
-
-# Activate
-
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows
-.\.venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
----
-
-# Running the Pipeline
-
-Before running the pipeline, place the candidate dataset (for example `candidates.jsonl`) in the repository root. The dataset is **not included** in this repository because of its size.
-
-Run the ranker:
-
-```bash
-python rank_candidates.py --candidates candidates.jsonl --jd-index jd_hybrid_index.json --output Real_RR.csv
-```
-
-Validate the submission:
-
-```bash
-python validate_submission.py Real_RR.csv
-```
-
----
-
 # Pipeline Overview
 
-1. Load the preprocessed JD hybrid index.
-2. Read candidate profiles.
-3. Apply conservative L0 structured triage.
-4. Compute Behavior Validation Score (BVS).
-5. Build enriched candidate retrieval documents.
-6. Perform BM25 lexical retrieval.
-7. Perform dense semantic retrieval using Sentence Transformers.
-8. Apply family-aware candidate recall.
-9. Rerank the strongest evidence with a Cross-Encoder.
-10. Combine semantic relevance, recruiter behavior, coverage, evidence density, and calibrated negative confidence into the final ranking score.
-11. Generate the final submission CSV.
+The ranking pipeline progressively narrows the candidate search space while increasing the sophistication of evaluation at each stage. Earlier stages are designed to efficiently eliminate obvious mismatches, whereas later stages perform increasingly expensive semantic verification only on the strongest candidates.
+
+```
+L0 Structured Triage
+        │
+        ▼
+Behavior Validation Score (BVS)
+        │
+        ▼
+Candidate Enrichment
+        │
+        ▼
+BM25 Lexical Retrieval
+        │
+        ▼
+Dense Vector Retrieval
+(Bi-Encoder)
+        │
+        ▼
+Family-aware Candidate Recall
+        │
+        ▼
+Cross-Encoder Pairwise Reranking
+        │
+        ▼
+Coverage Quality
++
+Evidence Density
++
+Negative Confidence
+        │
+        ▼
+Final Score Fusion
+        │
+        ▼
+Ranked Candidate List
+```
+
+## Stage 1 — L0 Structured Triage
+
+The pipeline begins with a conservative structured filtering stage using only explicit candidate metadata such as location, relocation preference, notice period, recruiter activity, profile completeness, and other structured hiring signals.
+
+This stage intentionally avoids semantic reasoning and removes only candidates with clear eligibility mismatches, reducing the search space while minimizing false negatives.
 
 ---
 
-# Notes
+## Stage 2 — Behavior Validation Score (BVS)
 
-* Candidate data is intentionally excluded from this repository due to file size limitations.
-* The first execution may take longer because embedding models and local caches are created.
-* Subsequent executions reuse cached models and embeddings for faster runtime.
-* The pipeline is designed for CPU execution and produces deterministic, explainable rankings suitable for hackathon evaluation.
+Every remaining candidate receives a Behavior Validation Score (BVS), representing recruiter-oriented profile quality independent of semantic relevance.
+
+BVS aggregates structured hiring signals including:
+
+* recruiter responsiveness
+* profile activity
+* notice period
+* experience alignment
+* interview completion
+* assessment performance
+* profile quality
+* market engagement
+* verification signals
+
+The score is calibrated using percentile normalization and smooth sigmoid shaping to prevent score saturation while preserving meaningful separation between candidates.
+
+---
+
+## Stage 3 — Candidate Enrichment
+
+Candidate narratives are enriched before retrieval using lightweight taxonomy expansion.
+
+Relevant technologies, production signals, retrieval terminology, deployment experience, and domain-specific concepts are appended as hidden retrieval tags.
+
+This improves recall without modifying the original candidate information or requiring additional embedding models.
+
+---
+
+## Stage 4 — Hybrid Retrieval
+
+Two complementary retrieval strategies operate in parallel.
+
+### BM25 Retrieval
+
+Sparse lexical matching identifies exact terminology overlap between the job description and candidate profile.
+
+This stage captures:
+
+* exact skills
+* technologies
+* product terminology
+* recruiter keywords
+
+---
+
+### Dense Vector Retrieval
+
+A Sentence Transformer Bi-Encoder converts candidate narratives and JD chunks into dense embeddings.
+
+Semantic similarity is computed using cosine similarity
+
+[
+\mathrm{CosSim}(x,y)=
+\frac{x\cdot y}
+{|x||y|}
+]
+
+allowing semantically related concepts to match even when exact wording differs.
+
+---
+
+## Stage 5 — Family-aware Candidate Recall
+
+Rather than selecting only globally highest scoring chunks, retrieval is diversified across multiple JD concept families such as:
+
+* Retrieval
+* Evaluation
+* Systems
+* Product
+* Domain
+* Culture
+* Advanced Skills
+
+This prevents a single topic from dominating retrieval and ensures broad coverage of the complete job description.
+
+---
+
+## Stage 6 — Cross-Encoder Reranking
+
+The strongest candidate–JD evidence pairs are evaluated using a Cross-Encoder.
+
+Unlike the Bi-Encoder, which embeds documents independently, the Cross-Encoder jointly processes both candidate evidence and JD text, producing substantially more accurate pairwise relevance estimates.
+
+Recent roles receive higher influence through recency-aware weighting while historical roles contribute proportionally less.
+
+The Cross-Encoder confidence is softly calibrated before fusion rather than directly altering overall ranking.
+
+---
+
+## Stage 7 — Coverage Quality
+
+Coverage measures how completely a candidate satisfies the different conceptual areas of the job description.
+
+Instead of counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score
+
+[
+Coverage=
+\frac{
+\sum_i
+w_i
+\cdot
+Best_i
+}
+{
+\sum_i w_i
+}
+]
+
+where
+
+* (Best_i) is the strongest semantic similarity for family (i)
+* (w_i) is the corresponding JD importance weight.
+
+This rewards both breadth and quality while avoiding double counting.
+
+---
+
+## Stage 8 — Evidence Density
+
+Evidence Density measures the consistency of strong supporting evidence across the candidate profile.
+
+Instead of rewarding large numbers of weak matches, only the strongest semantic evidence contributes
+
+[
+Evidence=
+0.5S_1+
+0.3S_2+
+0.2S_3
+]
+
+where
+
+(S_1,S_2,S_3)
+
+are the three strongest Cross-Encoder evidence scores.
+
+This favors candidates demonstrating consistently strong alignment rather than isolated high-scoring passages.
+
+---
+
+## Stage 9 — Negative Confidence
+
+Potential recruiter risks such as wrapper-only experience, research-only backgrounds, or weak production evidence are summarized into a calibrated Negative Confidence score.
+
+Rather than hard penalties, confidence is smoothly normalized so isolated keywords do not disproportionately reduce ranking.
+
+---
+
+## Stage 10 — Final Score Fusion
+
+The final ranking combines semantic relevance with structured recruiter signals while keeping each component responsible for a single aspect of candidate quality.
+
+Semantic relevance is computed as
+
+[
+Semantic=
+0.55\times CE_{adj}
++
+0.25\times BE
++
+0.20\times BM25
+]
+
+where
+
+* (CE_{adj}) is the confidence-calibrated Cross-Encoder score,
+* (BE) is the Bi-Encoder similarity,
+* (BM25) is the lexical relevance score.
+
+The final ranking score is then obtained by combining
+
+* semantic relevance,
+* coverage quality,
+* evidence density,
+* Behavior Validation Score (BVS),
+* calibrated negative confidence,
+
+into a single interpretable ranking function.
+
+Each component measures a distinct property of candidate quality, reducing duplicated signals while producing stable, explainable rankings suitable for production-inspired recruiter workflows.
