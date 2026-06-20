@@ -281,17 +281,20 @@ def percentile_rank(values: np.ndarray) -> np.ndarray:
 
 
 def stretch_bvs_percentile(rank_values: np.ndarray) -> np.ndarray:
-    """Spread the BVS middle band so close candidates separate more cleanly."""
+    """Spread the BVS middle band gently while preserving separation at the top."""
     ranks = np.asarray(rank_values, dtype=np.float32)
-    stretched = sigmoid((ranks - 0.53) * 7.2)
+    stretched = sigmoid((ranks - 0.56) * 4.2)
     return np.clip(stretched, 0.0, 1.0).astype(np.float32)
 
 
 def shape_bvs_score(raw_bvs: float) -> float:
-    """Preserve the existing raw BVS shaping before percentile spreading."""
-    raw_bvs = clamp01(raw_bvs)
-    shaped = 0.04 + 0.90 * (raw_bvs ** 0.82)
-    return clamp01(shaped)
+    """Map raw structured evidence into a smooth but non-saturating [0, 1] band."""
+    if math.isnan(raw_bvs) or math.isinf(raw_bvs):
+        return 0.0
+
+    # Keep the middle band visible so BVS remains discriminative after calibration.
+    shaped = sigmoid((float(raw_bvs) - 0.55) * 2.80)
+    return clamp01(0.03 + 0.94 * shaped)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -2489,7 +2492,11 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"[ranker] loading candidates from {candidate_path}", file=sys.stderr)
     candidates, bvs_scores, discarded, l0_threshold = load_candidates(candidate_path, as_of, args.max_candidates)
-    bvs_scores = stretch_bvs_percentile(percentile_rank(bvs_scores))
+    raw_bvs_scores = np.asarray(bvs_scores, dtype=np.float32)
+    bvs_scores = (
+        0.70 * raw_bvs_scores
+        + 0.30 * stretch_bvs_percentile(percentile_rank(raw_bvs_scores))
+    ).astype(np.float32)
     print(f"[ranker] L0 kept={len(candidates)} discarded={len(discarded)} threshold={l0_threshold:.3f}", file=sys.stderr)
 
     # Optional diagnostics: off by default so the repo only emits the CSV the hackathon requires.
@@ -2686,36 +2693,36 @@ def run(args: argparse.Namespace) -> int:
         evidence_bonus *= 1.15
 
         # 3. SMART PENALTY CATEGORIZATION
-        wrapper_pen = negative_breakdown.get("wrapper", 0.0)
-        domain_pen = negative_breakdown.get("wrong_domain", 0.0)
-        research_pen = negative_breakdown.get("research", 0.0)
-        framework_pen = negative_breakdown.get("framework", 0.0)
+        wrapper_pen = clamp01(negative_breakdown.get("wrapper", 0.0))
+        domain_pen = clamp01(negative_breakdown.get("wrong_domain", 0.0))
+        research_pen = clamp01(negative_breakdown.get("research", 0.0))
+        framework_pen = clamp01(negative_breakdown.get("framework", 0.0))
 
-        smart_narrative_multiplier = 1.0
-        
-        # Tier 1 Fatal: OpenAI Wrappers & Langchain prompt-engineers. Suppress violently.
-        if wrapper_pen > 0.20:
-            smart_narrative_multiplier *= math.exp(-wrapper_pen * 4.5)  
-            
-        # Tier 2 Severe: Pure CV/Speech engineers applying for Search/Ranking roles.
-        if domain_pen > 0.20:
-            smart_narrative_multiplier *= math.exp(-domain_pen * 3.5)   
-            
-        # Tier 3 Moderate: Academic/Research heavy (missing production deployment).
-        if research_pen > 0.20:
-            smart_narrative_multiplier *= math.exp(-research_pen * 2.5) 
-            
-        # Tier 4 Mild: Built prototypes/POCs but lacks system architecture depth.
-        if framework_pen > 0.20:
-            smart_narrative_multiplier *= math.exp(-framework_pen * 1.5) 
+        # Smooth category-aware penalty curve: no cliff at arbitrary thresholds.
+        # Stronger families still matter more, but each signal contributes continuously.
+        smart_penalty_strength = (
+            0.90 * wrapper_pen
+            + 0.70 * domain_pen
+            + 0.55 * research_pen
+            + 0.35 * framework_pen
+        )
+
+        support_count = sum(
+            1 for value in (wrapper_pen, domain_pen, research_pen, framework_pen)
+            if value >= 0.10
+        )
+        if support_count >= 2:
+            smart_penalty_strength *= 1.0 + 0.06 * (support_count - 1)
+
+        smart_narrative_multiplier = math.exp(-1.8 * smart_penalty_strength)
 
         # 4. INCREASE EXPLICIT CE PENALTY
         # If the neural network specifically flagged negative chunks (C19-C24), hit them harder.
         ce_penalty = float(cross_neg_scores[offset])
         safe_penalty = ce_penalty if ce_penalty > 0.05 else 0.0
-        
-        # Combine the Cross-Encoder penalty (now 3.5x instead of 2.0x) with the Smart Category penalty
-        penalty_multiplier = math.exp(-safe_penalty * 3.5) * smart_narrative_multiplier
+
+        # Combine the Cross-Encoder penalty with the smooth narrative penalty.
+        penalty_multiplier = math.exp(-safe_penalty * 3.2) * smart_narrative_multiplier
 
         final_scores[cand_idx] = (base_score + coverage_bonus + evidence_bonus) * penalty_multiplier
 
@@ -2755,7 +2762,59 @@ def run(args: argparse.Namespace) -> int:
             f"Only {len(ranked)} reranked candidates available; cannot write exactly {args.top_k}. "
             "Increase --shortlist-size or use --allow-fewer-than-top-k for smoke tests."
         )
+    # --- DIAGNOSTIC TABLE GENERATION ---
+    diagnostic_path = Path("diagnostic_top20.csv")
+    with diagnostic_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "Rank", "Candidate_ID", "CE", "Bi_Norm", "BVS", "Coverage", "Density", "Smart_Multiplier", "Final"
+        ])
+        writer.writeheader()
+        for rank, cand_idx in enumerate(ranked[:20], 1):
+            # Find their position in the shortlist
+            offset = shortlist.index(cand_idx) if cand_idx in shortlist else -1
+            
+            # Recalculate components (mirroring the loop)
+            ce_tech = float(cross_scores_shortlist[offset]) if offset != -1 else 0.0
+            semantic_boost = float(semantic_final_norm[cand_idx])
+            behavior_boost = float(bvs_scores[cand_idx])
+            
+            adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
+            coverage_bonus, _, _ = positive_family_coverage_bonus(adjusted_row, chunks)
+            evidence_bonus, _ = evidence_density_bonus(adjusted_row, chunks)
+            
+            _, negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
+            
+            coverage_bonus *= 1.15
+            evidence_bonus *= 1.15
+            
+            wrapper_pen = negative_breakdown.get("wrapper", 0.0)
+            domain_pen = negative_breakdown.get("wrong_domain", 0.0)
+            research_pen = negative_breakdown.get("research", 0.0)
+            framework_pen = negative_breakdown.get("framework", 0.0)
 
+            smart_multiplier = 1.0
+            if wrapper_pen > 0.20: smart_multiplier *= math.exp(-wrapper_pen * 4.5)  
+            if domain_pen > 0.20: smart_multiplier *= math.exp(-domain_pen * 3.5)   
+            if research_pen > 0.20: smart_multiplier *= math.exp(-research_pen * 2.5) 
+            if framework_pen > 0.20: smart_multiplier *= math.exp(-framework_pen * 1.5) 
+
+            ce_penalty = float(cross_neg_scores[offset]) if offset != -1 else 0.0
+            safe_penalty = ce_penalty if ce_penalty > 0.05 else 0.0
+            final_multiplier = math.exp(-safe_penalty * 3.5) * smart_multiplier
+            
+            writer.writerow({
+                "Rank": rank,
+                "Candidate_ID": candidates[cand_idx].candidate_id,
+                "CE": f"{ce_tech:.4f}",
+                "Bi_Norm": f"{semantic_boost:.4f}",
+                "BVS": f"{behavior_boost:.4f}",
+                "Coverage": f"{coverage_bonus:.4f}",
+                "Density": f"{evidence_bonus:.4f}",
+                "Smart_Multiplier": f"{final_multiplier:.4f}",
+                "Final": f"{float(final_scores[cand_idx]):.4f}"
+            })
+    print(f"[ranker] wrote {diagnostic_path} for manual inspection", file=sys.stderr)
+    # -----------------------------------
     write_top_output(output_path, ranked, final_scores, candidates, chunks, cross_adjusted_full, min(args.top_k, len(ranked)))
 
     if args.scores_output:
