@@ -22,7 +22,7 @@ compute:
   platform: "Vstudio Code"
   cpu_cores: 8
   ram_gb: 16
-  python_version: "3.11.x"
+  python_version: "3.12.x"
   os: "Windows"
   uses_gpu_for_inference: false
   has_network_during_ranking: false
