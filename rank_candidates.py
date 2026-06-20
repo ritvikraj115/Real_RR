@@ -2828,46 +2828,6 @@ def run(args: argparse.Namespace) -> int:
             f"Only {len(ranked)} reranked candidates available; cannot write exactly {args.top_k}. "
             "Increase --shortlist-size or use --allow-fewer-than-top-k for smoke tests."
         )
-
-    # --- DIAGNOSTIC TABLE GENERATION ---
-    diagnostic_path = Path("diagnostic_top20.csv")
-    with diagnostic_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "Rank", "Candidate_ID", "CE", "Bi_Norm", "BVS", "Coverage", "Density", "Smart_Multiplier", "Final"
-        ])
-        writer.writeheader()
-        for rank, cand_idx in enumerate(ranked[:20], 1):
-            offset = shortlist.index(cand_idx) if cand_idx in shortlist else -1
-
-            ce_tech = float(cross_scores_shortlist[offset]) if offset != -1 else 0.0
-            semantic_boost = float(semantic_final_norm[cand_idx])
-            behavior_boost = float(bvs_scores[cand_idx])
-
-            adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
-            coverage_bonus, coverage_quality, family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
-            evidence_bonus, evidence_quality, evidence_hits = evidence_density_bonus(adjusted_row, chunks)
-            negative_conf, _ = negative_confidence_details(candidates[cand_idx].candidate_text)
-
-            smart_multiplier = 0.90 + 0.10 * float(sigmoid((0.68 * coverage_quality + 0.32 * evidence_quality - 0.50) * 5.0))
-
-            ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4) if offset != -1 else 1.0
-            ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
-            base_score = (0.55 * ce_adjusted) + (0.25 * semantic_boost) + (0.20 * behavior_boost)
-            final_raw = base_score + coverage_bonus + evidence_bonus
-            final_value = float(final_raw * negative_confidence_penalty(negative_conf))
-
-            writer.writerow({
-                "Rank": rank,
-                "Candidate_ID": candidates[cand_idx].candidate_id,
-                "CE": f"{ce_tech:.4f}",
-                "Bi_Norm": f"{semantic_boost:.4f}",
-                "BVS": f"{behavior_boost:.4f}",
-                "Coverage": f"{coverage_bonus:.4f}",
-                "Density": f"{evidence_bonus:.4f}",
-                "Smart_Multiplier": f"{smart_multiplier:.4f}",
-                "Final": f"{final_value:.4f}"
-            })
-    print(f"[ranker] wrote {diagnostic_path} for manual inspection", file=sys.stderr)
     # -----------------------------------
     write_top_output(output_path, ranked, final_scores, candidates, chunks, cross_adjusted_full, min(args.top_k, len(ranked)))
 
