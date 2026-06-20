@@ -75,10 +75,7 @@ Before running the pipeline, place the candidate dataset (for example `candidate
 Run the ranker:
 
 ```bash
-python rank_candidates.py \
-    --candidates candidates.jsonl \
-    --jd-index jd_hybrid_index.json \
-    --output Real_RR.csv
+python rank_candidates.py --candidates candidates.jsonl --jd-index jd_hybrid_index.json --output Real_RR.csv
 ```
 
 Validate the submission:
