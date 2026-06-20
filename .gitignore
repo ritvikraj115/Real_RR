@@ -20,3 +20,4 @@ candidates.jsonl.gz
 sample_candidates.json
 setup_offline_models.py
 models/BAAI__bge-small-en-v1.5/model.safetensors
+Real_RR.csv

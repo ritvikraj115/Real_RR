@@ -1,96 +1,103 @@
-# Redrob Hackathon Ranker Package
+# Repository Structure
 
-This repository contains our submission-ready ranking system for the Redrob Hackathon.
+```text
+.
+├── models/                         # Cached HuggingFace models
+├── app.py                          # Streamlit demo (optional)
+├── jd_hybrid_index.json            # Preprocessed job description index
+├── rank_candidates.py              # Main ranking pipeline
+├── validate_submission.py          # Submission validator
+├── submission_metadata.yaml
+├── requirements.txt
+├── README.md
+├── ranking_pipeline_README.md
+└── final_all_scores_features.csv   # Analysis output (generated/optional)
+```
 
-## What this project does
+> **Note:** The candidate dataset (`candidates.jsonl`) is **not included in this repository** because of its large size. Before running the pipeline, place the provided `candidates.jsonl` file in the project root (same directory as `rank_candidates.py`).
 
-We rank candidates for the job description using a compact offline pipeline built for the hackathon constraints:
-BM25 → Bi-Encoder → Cross-Encoder → final top 100.
+---
 
-The goal is not only to find good candidates, but to rank them in a way that is fast, reproducible, and explainable under a 5-minute CPU-only limit.
+# Installation
 
-## Why this ranker is different
-
-Most rankers over-focus on one signal. Ours tries to balance the full problem:
-
-- **Retrieval breadth** through BM25 family recall
-- **Semantic matching** through a bi-encoder shortlist
-- **Precision reranking** through a cross-encoder
-- **Behavioral fit** through BVS
-- **Coverage and evidence bonuses** so candidates who match more of the JD are rewarded
-- **Negative confidence penalties** so wrapper-only, research-only, and demo-only profiles are pushed down
-- **Overlap suppression** so repeated JD ideas do not inflate scores unfairly
-
-That combination keeps us away from “keyword stuffing” and toward a more realistic hiring-style ranking.
-
-## The math idea behind the model
-
-The pipeline is designed like a funnel.
-
-First, we keep the candidate pool broad enough to avoid missing strong profiles. Then we narrow it down using stronger scoring.
-
-At a high level:
-
-1. **L0 triage** removes only clearly invalid or direct-signal mismatches.
-2. **BM25** retrieves candidates by lexical fit across JD families.
-3. **Bi-Encoder** gives a semantic shortlist for deeper matching.
-4. **Cross-Encoder** reranks only the best candidate-chunk pairs.
-5. **Final score fusion** combines:
-   - semantic match,
-   - BVS,
-   - coverage bonus,
-   - evidence density bonus,
-   - negative confidence penalty.
-
-The scoring is intentionally not a simple one-signal ranking. It uses a mix of additive and multiplicative logic so one strong signal cannot completely hide weak overall fit.
-
-## What we changed carefully
-
-We kept the architecture the same, but improved it in ways that matter in a hackathon:
-
-- We made CE chunk selection more focused so runtime stays safe.
-- We improved breadth by rewarding candidates who cover more JD families.
-- We extracted achievement sentences so the cross-encoder sees real impact, not only profile text.
-- We made the negative side a confidence score instead of a blunt keyword hit.
-- We kept BVS meaningful, but not overpowering.
-- We avoided extra output files and keep the final submission clean.
-
-## Step-by-step flow
-
-The ranker follows this order:
-
-1. Read `jd_hybrid_index.json`
-2. Load candidates from `candidates.jsonl`
-3. Apply L0 triage
-4. Build BM25 recall over JD families
-5. Build bi-encoder scores for the shortlist
-6. Select the best 120 candidates for cross-encoding
-7. Rerank with cross-encoder using only the strongest chunks
-8. Apply coverage, evidence, BVS, and negative penalties
-9. Write `Real_RR.csv`
-
-## Caching strategy
-
-We keep only the local caches that help runtime and reproducibility:
-
-- `cache/jd_vector_embeddings.npz`
-- `cache/pre_shortlist_vector_scores.npz`
-- `cache/shortlist_cross_scores.npz`
-
-These are local speedups. Candidate-level caches are intentionally not the focus, so the pipeline stays cleaner and safer for evaluation.
-
-## Files to keep
-
-- `rank_candidates.py` — full ranking pipeline
-- `validate_submission.py` — CSV validator
-- `requirements.txt` — dependencies
-- `submission_metadata.yaml` — submission metadata
-- `README.md` — setup and usage
-- `cache/` — local cache directory
-- `models/` — caching embedding models
-
-## Typical commands
+Clone the repository and install the required dependencies.
 
 ```bash
-python rank_candidates.py --candidates candidates.jsonl --jd-index jd_hybrid_index.json --output Real_RR.csv
+git clone <repository-url>
+cd <repository-name>
+
+pip install -r requirements.txt
+```
+
+---
+
+# Required Files
+
+Before running the ranker, your project directory should contain:
+
+```text
+.
+├── candidates.jsonl          ← Add this file before running
+├── jd_hybrid_index.json
+├── rank_candidates.py
+├── requirements.txt
+└── ...
+```
+
+---
+
+# Running the Ranking Pipeline
+
+Run the main ranking pipeline:
+
+```bash
+python rank_candidates.py \
+    --candidates candidates.jsonl \
+    --jd-index jd_hybrid_index.json \
+    --output Real_RR.csv
+```
+
+The pipeline will:
+
+1. Load the candidate dataset.
+2. Load the preprocessed JD index.
+3. Apply structured L0 candidate triage.
+4. Compute Behavior Validation Score (BVS).
+5. Build the engineered candidate document.
+6. Perform BM25 lexical retrieval.
+7. Perform Bi-Encoder semantic retrieval.
+8. Select family-aware evidence for reranking.
+9. Run Cross-Encoder verification.
+10. Fuse semantic, behavioral, structured, and evidence-based scores.
+11. Generate the final ranked submission.
+
+---
+
+# Validate Submission
+
+After ranking completes, validate the generated CSV.
+
+```bash
 python validate_submission.py Real_RR.csv
+```
+
+---
+
+# Output
+
+The pipeline generates:
+
+```text
+Real_RR.csv
+```
+
+which contains the final ranked candidate list in the required submission format.
+
+---
+
+# Notes
+
+- `jd_hybrid_index.json` is already preprocessed and ready to use.
+- `candidates.jsonl` must be provided separately before execution.
+- The pipeline is designed for CPU-only execution and uses local caching to improve runtime.
+- HuggingFace models will be downloaded automatically on the first run and reused from the `models/` directory on subsequent runs.

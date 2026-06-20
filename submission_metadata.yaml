@@ -14,9 +14,9 @@ team_members:
     email: "ritvikraj.ipl@gmail.com"
     role: "Team Lead"
 
-github_repo: "https://github.com/YOUR_USERNAME/YOUR_REPO"
-sandbox_link: "https://YOUR-SANDBOX-LINK"
-reproduce_command: "python rank.py --candidates ./candidates.jsonl.gz --out ./submission.csv"
+github_repo: "https://github.com/ritvikraj115/Real_RR"
+sandbox_link: "https://ritvikraj115-real-rr-app-ojm7p5.streamlit.app/"
+reproduce_command: "python rank_candidates.py --candidates candidates.jsonl --jd-index jd_hybrid_index.json --output Real_RR.csv "
 
 compute:
   platform: "Vstudio Code"
@@ -36,8 +36,42 @@ ai_usage_summary: |
   Used AI assistance for architecture discussion, code review, and debugging.
 
 methodology_summary: |
-  Hybrid candidate ranking system with conservative L0 triage, BM25 retrieval,
-  vector retrieval, cross-encoder reranking, and behavior-aware final scoring.
+  This project implements a production-inspired, multi-stage candidate ranking
+  engine that progressively narrows a large candidate pool into a high-quality,
+  recruiter-ready shortlist. Instead of relying on a single similarity score,
+  the pipeline combines structured eligibility checks, recruiter behavior
+  signals, lexical retrieval, semantic retrieval, and deep neural reranking,
+  allowing each stage to focus on a specific part of the hiring decision.
+
+  The process begins with a conservative L0 triage that removes only candidates
+  with clear structured mismatches such as logistics or availability, while
+  preserving recall for technically strong profiles. A Behavior Validation Score
+  (BVS) is then computed from recruiter-oriented signals including candidate
+  activity, responsiveness, profile quality, experience, and availability to
+  estimate practical hiring readiness.
+
+  Candidate profiles are transformed into enriched retrieval documents by
+  combining profile information, career history, inferred semantic tags, and
+  role-specific signals. Hybrid retrieval then uses BM25 for precise lexical
+  matching and dense embeddings for semantic similarity, ensuring both exact
+  terminology and conceptually related experience contribute to retrieval.
+
+  Rather than simply selecting the highest-scoring matches, the system performs
+  family-aware evidence selection to ensure balanced coverage across different
+  job requirements. Only the strongest evidence from the most promising
+  candidates is forwarded to a Cross-Encoder, which performs detailed pairwise
+  verification between job-description chunks and candidate evidence while
+  incorporating recency-aware role selection and impact-focused achievement
+  snippets.
+
+  The final ranking is produced by combining semantic relevance, lexical
+  relevance, cross-encoder confidence, structured hiring signals, recruiter
+  behavior, job-description coverage, evidence density, and confidence-calibrated
+  negative penalties into a single explainable score. This progressive design
+  improves ranking quality, reduces computational cost by limiting expensive
+  neural inference to a small shortlist, and produces rankings that more closely
+  resemble real-world recruiter decision making while remaining efficient enough
+  for CPU-only execution.
 
 declarations:
   read_submission_spec: true
