@@ -33,8 +33,16 @@ DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 JD_EMBEDDING_CACHE_VERSION = 2
 VECTOR_SCORE_CACHE_VERSION = 3
-CROSS_SCORE_CACHE_VERSION = 13
+CROSS_SCORE_CACHE_VERSION = 17
 BVS_MIN_THRESHOLD = 0.27
+
+# Cross-encoder calibration controls
+CROSS_ENCODER_LOGIT_BIAS = 0.0
+CROSS_ENCODER_TEMPERATURE = 3.50
+CE_SCORE_EPS = 1e-4
+
+# BVS calibration controls
+BVS_PERCENTILE_BLEND = 0.34
 
 # Chunk-family coverage controls
 CHUNK_FAMILIES: dict[str, str] = {
@@ -281,9 +289,11 @@ def percentile_rank(values: np.ndarray) -> np.ndarray:
 
 
 def stretch_bvs_percentile(rank_values: np.ndarray) -> np.ndarray:
-    """Spread the BVS middle band gently while preserving separation at the top."""
+    """Spread the BVS upper tail so near-ties stay separable."""
     ranks = np.asarray(rank_values, dtype=np.float32)
-    stretched = sigmoid((ranks - 0.50) * 3.25)
+    ranks = np.clip(ranks, 0.0, 1.0)
+    # Power-law tail expansion: small percentile gaps near 1.0 get magnified.
+    stretched = 1.0 - np.power(np.clip(1.0 - ranks, 0.0, 1.0), 0.45)
     return np.clip(stretched, 0.0, 1.0).astype(np.float32)
 
 
@@ -1222,7 +1232,7 @@ def cross_score_metadata(
         "cross_encoder_model": cross_encoder_model,
         "candidate_keys": candidate_keys,
         "chunk_ids": chunk_ids,
-        "score_transform": "sigmoid_if_outside_0_1",
+        "score_transform": "sigmoid_then_epsilon_clip",
     }
 
 
@@ -2277,7 +2287,23 @@ def compute_cross_encoder_scores(
     raw_scores = model.predict(all_pairs, batch_size=batch_size, show_progress_bar=True) if all_pairs else np.asarray([], dtype=np.float32)
     raw_scores = np.asarray(raw_scores, dtype=np.float32).flatten()
     if raw_scores.size and (float(raw_scores.min()) < 0.0 or float(raw_scores.max()) > 1.0):
-        raw_scores = sigmoid(raw_scores).astype(np.float32)
+        finite_scores = raw_scores[np.isfinite(raw_scores)]
+        if finite_scores.size:
+            # Calibrate logits, not probabilities: center on the shortlist median and
+            # use a wider spread so high-end evidence does not collapse to 1.0.
+            ce_bias = float(np.median(finite_scores))
+            if finite_scores.size >= 5:
+                p10 = float(np.percentile(finite_scores, 10))
+                p90 = float(np.percentile(finite_scores, 90))
+                spread = max(1e-6, p90 - p10)
+                ce_temp = max(CROSS_ENCODER_TEMPERATURE, 0.5 * spread)
+            else:
+                ce_temp = CROSS_ENCODER_TEMPERATURE
+            raw_scores = sigmoid((raw_scores - ce_bias) / ce_temp).astype(np.float32)
+        else:
+            raw_scores = sigmoid((raw_scores - CROSS_ENCODER_LOGIT_BIAS) / CROSS_ENCODER_TEMPERATURE).astype(np.float32)
+    if raw_scores.size:
+        raw_scores = np.clip(raw_scores, CE_SCORE_EPS, 1.0 - CE_SCORE_EPS).astype(np.float32)
 
     cand_chunk_max = defaultdict(lambda: defaultdict(float))
     for meta, score in zip(pair_meta, raw_scores):
@@ -2312,7 +2338,7 @@ def compute_cross_encoder_scores(
                 top_scores = row[top]
                 max_score = float(top_scores[0]) if top_scores.size else 0.0
                 mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
-                pos_scores[row_idx] = float(clamp01(0.70 * max_score + 0.30 * mean_top))
+                pos_scores[row_idx] = float(np.clip(clamp01(0.70 * max_score + 0.30 * mean_top), CE_SCORE_EPS, 1.0 - CE_SCORE_EPS))
         if neg_cols:
             row = np.asarray(cross_adjusted[row_idx, neg_cols], dtype=np.float32)
             if row.size:
@@ -2321,7 +2347,7 @@ def compute_cross_encoder_scores(
                 top_scores = row[top]
                 max_score = float(top_scores[0]) if top_scores.size else 0.0
                 mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
-                neg_scores[row_idx] = float(clamp01(0.70 * max_score + 0.30 * mean_top))
+                neg_scores[row_idx] = float(np.clip(clamp01(0.70 * max_score + 0.30 * mean_top), CE_SCORE_EPS, 1.0 - CE_SCORE_EPS))
 
     return pos_scores, neg_scores, cross_adjusted, f"sentence_transformers_cross_encoder:{model_path}"
 
@@ -2555,8 +2581,8 @@ def run(args: argparse.Namespace) -> int:
     candidates, bvs_scores, discarded, l0_threshold = load_candidates(candidate_path, as_of, args.max_candidates)
     raw_bvs_scores = np.asarray(bvs_scores, dtype=np.float32)
     bvs_scores = (
-        0.78 * raw_bvs_scores
-        + 0.22 * stretch_bvs_percentile(percentile_rank(raw_bvs_scores))
+        (1.0 - BVS_PERCENTILE_BLEND) * raw_bvs_scores
+        + BVS_PERCENTILE_BLEND * stretch_bvs_percentile(percentile_rank(raw_bvs_scores))
     ).astype(np.float32)
     print(f"[ranker] L0 kept={len(candidates)} discarded={len(discarded)} threshold={l0_threshold:.3f}", file=sys.stderr)
 
