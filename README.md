@@ -207,15 +207,11 @@ This stage captures:
 
 Candidate narratives and JD chunks are encoded using a Sentence Transformer Bi-Encoder.
 
-Semantic similarity is computed using cosine similarity
+Semantic similarity is computed using cosine similarity:
 
-[
-\text{CosSim}(x,y)
-==================
-
-\frac{x\cdot y}
-{|x||y|}
-]
+$$
+\operatorname{CosSim}(x,y)=\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
+$$
 
 allowing semantically similar concepts to match even when different terminology is used.
 
@@ -252,15 +248,9 @@ Each selected candidate chunk is then jointly encoded with its corresponding JD 
 
 When the Cross-Encoder returns logits, confidence calibration is applied before conversion to probabilities:
 
-[
-p
-=
-
-\sigma
-\left(
-\frac{z-b}{T}
-\right)
-]
+$$
+p = \sigma\!\left(\frac{z-b}{T}\right)
+$$
 
 where
 
@@ -271,20 +261,11 @@ where
 
 Only a single sigmoid transformation is applied.
 
-The strongest semantic evidence is then aggregated using a consistency-aware formulation
+The strongest semantic evidence is then aggregated using a consistency-aware formulation:
 
-[
-CE
-==
-
-0.7
-\times
-\max(\text{Top3})
-+
-0.3
-\times
-\operatorname{mean}(\text{Top3})
-]
+$$
+CE = 0.7\times\max(\text{Top3}) + 0.3\times\operatorname{mean}(\text{Top3})
+$$
 
 which rewards candidates demonstrating consistently strong evidence rather than relying on a single exceptional passage.
 
@@ -294,23 +275,11 @@ which rewards candidates demonstrating consistently strong evidence rather than 
 
 Coverage measures how completely a candidate satisfies the conceptual areas represented within the job description.
 
-Rather than counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score
+Rather than counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score:
 
-[
-Coverage
-========
-
-\frac{
-\sum_i
-w_i
-\cdot
-Best_i
-}
-{
-\sum_i
-w_i
-}
-]
+$$
+Coverage = \frac{\sum_i w_i\cdot Best_i}{\sum_i w_i}
+$$
 
 where
 
@@ -325,20 +294,11 @@ This rewards both semantic quality and conceptual breadth while avoiding duplica
 
 Evidence Density measures the consistency of supporting semantic evidence throughout the candidate profile.
 
-Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes
+Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes:
 
-[
-Evidence
-========
-
-0.7
-\times
-\max(\text{Top3})
-+
-0.3
-\times
-\operatorname{mean}(\text{Top3})
-]
+$$
+Evidence = 0.7\times\max(\text{Top3}) + 0.3\times\operatorname{mean}(\text{Top3})
+$$
 
 encouraging candidates who consistently demonstrate strong relevance across multiple supporting passages.
 
@@ -354,24 +314,11 @@ Rather than applying hard penalties, multiple negative signals are aggregated in
 
 ## Stage 10 — Final Score Fusion
 
-Semantic relevance is computed as
+Semantic relevance is computed as:
 
-[
-Semantic
-========
-
-0.55
-\times
-CE_{adj}
-+
-0.25
-\times
-BE
-+
-0.20
-\times
-BM25
-]
+$$
+Semantic = 0.55\times CE_{adj} + 0.25\times BE + 0.20\times BM25
+$$
 
 where
 
