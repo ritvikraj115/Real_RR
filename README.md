@@ -358,8 +358,6 @@ To improve reproducibility and runtime, the pipeline caches intermediate computa
 * Sentence Transformer models
 * Cross-Encoder models
 * JD embeddings
-* Candidate embedding scores
-* Cross-Encoder pairwise scores
 
 The first execution downloads models and creates caches. Subsequent executions reuse these cached artifacts to significantly reduce runtime while preserving deterministic behaviour.
 
