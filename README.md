@@ -20,8 +20,6 @@ Rather than relying on a single ranking signal, the system combines **structured
 ├── submission_metadata.yaml        # Challenge metadata
 ├── requirements.txt                # Python dependencies
 ├── README.md
-├── ranking_pipeline_README.md      # Detailed pipeline explanation
-└── final_all_scores_features.csv   # Optional diagnostic output
 ```
 
 ---
