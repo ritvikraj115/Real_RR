@@ -46,6 +46,10 @@ The pipeline was developed and validated using the following environment.
 We recommend using a clean virtual environment.
 
 ```bash
+#Clone Repo
+
+git clone https://github.com/ritvikraj115/Real_RR.git
+
 # Create virtual environment (Python 3.12)
 
 py -3.12 -m venv .venv
