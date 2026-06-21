@@ -20,8 +20,6 @@ Rather than relying on a single ranking signal, the system combines **structured
 ├── submission_metadata.yaml        # Challenge metadata
 ├── requirements.txt                # Python dependencies
 ├── README.md
-├── ranking_pipeline_README.md      # Detailed pipeline explanation
-└── final_all_scores_features.csv   # Optional diagnostic output
 ```
 
 ---
@@ -48,9 +46,13 @@ The pipeline was developed and validated using the following environment.
 We recommend using a clean virtual environment.
 
 ```bash
+#Clone Repo
+
+git clone https://github.com/ritvikraj115/Real_RR.git
+
 # Create virtual environment (Python 3.12)
 
-python3.12 -m venv .venv
+py -3.12 -m venv .venv
 
 # Activate
 
@@ -358,8 +360,6 @@ To improve reproducibility and runtime, the pipeline caches intermediate computa
 * Sentence Transformer models
 * Cross-Encoder models
 * JD embeddings
-* Candidate embedding scores
-* Cross-Encoder pairwise scores
 
 The first execution downloads models and creates caches. Subsequent executions reuse these cached artifacts to significantly reduce runtime while preserving deterministic behaviour.
 
