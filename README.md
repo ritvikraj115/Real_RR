@@ -48,7 +48,7 @@ We recommend using a clean virtual environment.
 ```bash
 # Create virtual environment (Python 3.12)
 
-python3.12 -m venv .venv
+py -3.12 -m venv .venv
 
 # Activate
 
