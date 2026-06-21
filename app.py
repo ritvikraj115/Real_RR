@@ -40,6 +40,14 @@ st.set_page_config(
     layout="wide",
 )
 
+# --- UPTIME ROBOT HEALTH CHECK ---
+# If the URL contains ?ping=true, bypass the app and just return a simple status
+if "ping" in st.query_params:
+    if st.query_params["ping"] == "true":
+        st.write("App is awake and healthy.")
+        st.stop() # Stops the rest of the heavy models from loading
+# ---------------------------------
+
 
 def _resolve_local_model(model_name: str) -> str:
     """Prefer local artifacts if present; fall back to the HF id only if needed."""
