@@ -2813,8 +2813,23 @@ def run(args: argparse.Namespace) -> int:
         ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
         ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
 
-        # CE remains dominant; BM25/semantic and BVS refine the ranking.
-        base_score = (0.55 * ce_adjusted) + (0.25 * semantic_boost) + (0.20 * behavior_boost)
+        # Adaptive reliability-weighted semantic fusion: weights shift slightly with agreement
+        # while staying normalized and keeping CE the dominant signal.
+        fusion_base = np.asarray([0.55, 0.25, 0.20], dtype=np.float32)
+        fusion_signals = np.asarray([ce_adjusted, semantic_boost, behavior_boost], dtype=np.float32)
+        signal_reliability = np.asarray([
+            1.0 - (abs(ce_proxy - bi_proxy) + abs(ce_proxy - bm25_proxy)) / 2.0,
+            1.0 - (abs(bi_proxy - ce_proxy) + abs(bi_proxy - bm25_proxy)) / 2.0,
+            1.0 - (abs(bm25_proxy - ce_proxy) + abs(bm25_proxy - bi_proxy)) / 2.0,
+        ], dtype=np.float32)
+        signal_reliability = np.clip(signal_reliability, 0.0, 1.0)
+        fusion_weights = fusion_base * (0.85 + 0.15 * signal_reliability)
+        fusion_weight_sum = float(np.sum(fusion_weights))
+        if fusion_weight_sum > 0.0:
+            fusion_weights = fusion_weights / fusion_weight_sum
+        else:
+            fusion_weights = fusion_base
+        base_score = float(np.dot(fusion_weights, fusion_signals))
 
         # Keep coverage and evidence as genuine bonuses rather than a re-ranking cliff.
         final_raw = base_score + coverage_bonus + evidence_bonus
@@ -2904,7 +2919,7 @@ def run(args: argparse.Namespace) -> int:
             "jd_embeddings_cache": str(jd_embeddings_cache),
             "final_weights": {
                 "first_pass_hybrid": "Behavior-aware: 0.64 * semantic_norm + 0.36 * bvs_score",
-                "cross_encoder_final": "CE-calibrated: 0.55 * (CE * smart_multiplier) + 0.25 * semantic_boost + 0.20 * bvs_base",
+                "cross_encoder_final": "Adaptive reliability-weighted fusion over CE, semantic_boost, and bvs_base; CE remains the dominant signal after smart calibration",
                 "negative_penalty": "Calibrated narrative risk penalty: negative_confidence_penalty(negative_conf)",
             },
             "overlap_control": "connected-components near-duplicate suppression using chunk similarity thresholds",
