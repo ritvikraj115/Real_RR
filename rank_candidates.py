@@ -2428,7 +2428,11 @@ def make_reasoning(
     positive_families: list[str] = []
     for _, idx in pos[:4]:
         chunk = chunks[idx]
-        snippet = first_evidence_snippet(candidate_text, list(chunk.terms) + tokenize(chunk.bm25_query), reverse=True)
+        snippet = first_evidence_snippet(
+            candidate_text,
+            list(chunk.terms) + tokenize(chunk.bm25_query),
+            reverse=True,
+        )
         if snippet:
             positive_bits.append(f"{chunk.id}: {snippet}")
         elif len(positive_bits) < 2:
@@ -2441,60 +2445,52 @@ def make_reasoning(
     for _, idx in neg[:3]:
         chunk = chunks[idx]
         penalty_bits.append(f"{chunk.id}: penalty for {chunk_label(chunk)}")
-        if len(penalty_bits) >= 1:
-            break
+        break
     penalty_bits.extend(candidate.bvs_penalties[:2])
 
     strength_text = " ".join((candidate.bvs_strengths[:3] or [])).lower()
     top_family = positive_families[0] if positive_families else "UNKNOWN"
     family_count = len(set(positive_families))
     evidence_count = len(positive_bits)
+    behavior_count = len(candidate.bvs_strengths)
+    caution_count = len(penalty_bits)
 
-    if top_family in {"SYSTEMS", "PRODUCT", "ADVANCED"} or any(term in strength_text for term in ("production", "deployed", "shipped", "launched", "latency", "throughput")):
-        opening_templates = [
-            "Strong production-oriented alignment is visible in the candidate's most relevant evidence.",
-            "Excellent production and systems alignment stands out in the strongest evidence.",
-            "A production-heavy profile emerges clearly from the top-ranked evidence.",
-        ]
-    elif family_count >= 4:
-        opening_templates = [
-            "Broad coverage across the job requirements makes this a well-rounded match.",
-            "The candidate covers several JD families, which suggests a balanced fit.",
-            "Multiple JD families are represented, giving this profile good breadth.",
-        ]
-    elif evidence_count >= 2:
-        opening_templates = [
-            "Consistent supporting evidence reinforces the semantic match.",
-            "Multiple independent passages point to the same relevance signal.",
-            "The strongest evidence is repeated across more than one supporting passage.",
-        ]
-    elif candidate.bvs_strengths:
-        opening_templates = [
-            "A strong recruiter-oriented profile complements the semantic match.",
-            "Behavioral signals make this a smoother hiring profile.",
-            "Recruiter-side signals strengthen an already relevant candidate.",
-        ]
+    has_production_signal = top_family in {"SYSTEMS", "PRODUCT", "ADVANCED"} or any(
+        term in strength_text for term in ("production", "deployed", "shipped", "launched", "latency", "throughput")
+    )
+
+    if positive_bits:
+        if has_production_signal:
+            opener = "The strongest signal is production-oriented execution, reinforced by the candidate's matching evidence."
+        elif family_count >= 4:
+            opener = "The strongest signal is breadth across several JD families, which makes the fit look durable."
+        elif evidence_count >= 2:
+            opener = "The strongest signal is repeated narrative evidence pointing to the same role fit."
+        else:
+            opener = "The strongest signal is direct semantic alignment in the candidate narrative."
+    elif behavior_count > 0:
+        opener = "The strongest signal is recruiter-side readiness, with structured cues supporting the profile."
+    elif caution_count > 0:
+        opener = "The strongest signal is negative-confidence risk, so the profile deserves caution."
     else:
-        opening_templates = [
-            "Strong semantic alignment with the job requirements is visible in the candidate narrative.",
-            "The candidate shows clear semantic alignment with the role requirements.",
-            "Semantic fit is the main signal here, supported by candidate narrative evidence.",
-        ]
-
-    opener = opening_templates[sum(ord(ch) for ch in candidate.candidate_id) % len(opening_templates)]
+        return "No concise evidence available from candidate narrative or structured fields."
 
     sentences: list[str] = [opener]
 
     if positive_bits:
-        sentences.append(
-            "Key supporting evidence includes "
-            + "; ".join(positive_bits[:3])
-            + "."
-        )
+        if has_production_signal:
+            supporting_sentence = "Relevant evidence includes " + "; ".join(positive_bits[:3]) + "."
+        elif family_count >= 4:
+            supporting_sentence = "Supporting evidence spans " + str(family_count) + " JD families: " + "; ".join(positive_bits[:3]) + "."
+        elif evidence_count >= 2:
+            supporting_sentence = "Key supporting evidence includes " + "; ".join(positive_bits[:3]) + "."
+        else:
+            supporting_sentence = "The best supporting passage is " + positive_bits[0] + "."
+        sentences.append(supporting_sentence)
 
     if family_count:
         if family_count >= 4:
-            coverage_sentence = "Coverage spans several JD families, so the match is not isolated to one topic."
+            coverage_sentence = "Coverage spans several JD families, so the match is not isolated to one theme."
         elif family_count == 3:
             coverage_sentence = "Coverage is balanced across multiple JD families."
         elif family_count == 2:
@@ -2508,14 +2504,19 @@ def make_reasoning(
             s.replace("_", " ").replace("=", ": ")
             for s in candidate.bvs_strengths[:3]
         ]
-        sentences.append("Behavioral signals add support through " + "; ".join(strengths) + ".")
+        if has_production_signal:
+            behavior_sentence = "Recruiter-side signals add support through " + "; ".join(strengths) + "."
+        else:
+            behavior_sentence = "Behavioral signals add support through " + "; ".join(strengths) + "."
+        sentences.append(behavior_sentence)
 
     if penalty_bits:
         penalties = [p.replace("_", " ") for p in penalty_bits[:3]]
-        sentences.append("A small caution remains around " + "; ".join(penalties) + ".")
-
-    if not positive_bits and not candidate.bvs_strengths and not penalty_bits:
-        return "No concise evidence available from candidate narrative or structured fields."
+        if positive_bits:
+            caution_sentence = "A small caution remains around " + "; ".join(penalties) + "."
+        else:
+            caution_sentence = "The main caution remains around " + "; ".join(penalties) + "."
+        sentences.append(caution_sentence)
 
     return " ".join(sentences)[:900]
 
