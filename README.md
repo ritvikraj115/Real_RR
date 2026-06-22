@@ -13,6 +13,7 @@ Rather than relying on a single ranking signal, the system combines **structured
 ```text
 .
 ├── models/                         # Cached SentenceTransformer and Cross-Encoder models
+├── cache/                          # Cached JD embeddings and intermediate artifacts
 ├── app.py                          # Optional Streamlit demonstration
 ├── jd_hybrid_index.json            # Preprocessed hybrid JD index
 ├── rank_candidates.py              # Main ranking pipeline
@@ -26,7 +27,10 @@ Generated when you run the pipeline:
 
 ```text
 Real_RR.csv                         # Final submission file
+diagnostic_top20.csv                # Optional manual inspection output
 ```
+
+Optional diagnostic exports may also be written when the corresponding CLI flags are enabled.
 
 ---
 
@@ -53,7 +57,7 @@ We recommend using a clean virtual environment.
 
 ```bash
 # Clone the repo
-git clone https://github.com/ritvikraj115/Real_RR.git
+git clone <repo-url>
 cd Real_RR
 
 # Create virtual environment (Python 3.12)
@@ -166,18 +170,20 @@ Each remaining candidate receives a **Behavior Validation Score (BVS)** that mea
 The raw structured score is first shaped with a smooth non-saturating curve:
 
 $$
-\mathrm{shape\_bvs\_score}(x)=\mathrm{clip}\left(0.02 + 0.96\,\sigma\!\left((x-0.50)\times 4.20\right),\,0,\,1\right)
+r = 0.02 + 0.96\,\sigma\!\left(4.20(x-0.50)\right)
 $$
 
 where $\sigma$ is the sigmoid function.
 
-The pipeline then blends the raw score with a percentile-stretched version to keep the top end separable:
+The shaped score is then blended with a percentile-stretched version to keep the upper tail separable:
 
 $$
-\mathrm{BVS}=(1-\lambda)\,\mathrm{raw\_bvs}+\lambda\,\mathrm{stretch\_bvs\_percentile}\bigl(\mathrm{percentile\_rank}(\mathrm{raw\_bvs})\bigr)
+\mathrm{BVS}=(1-\lambda)r+\lambda\left(1-\bigl(1-\pi(r)\bigr)^{0.45}\right)
 $$
 
-The current blend coefficient is stored in the code as `BVS_PERCENTILE_BLEND`, which keeps the score spread meaningful while reducing top-end compression.
+where $\pi(r)$ is the percentile rank of $r$ and $\lambda=0.34$.
+
+This keeps the score spread meaningful while reducing top-end compression.
 
 The score combines structured hiring signals including:
 
@@ -260,62 +266,74 @@ Instead of evaluating every available candidate passage, the pipeline retains on
 
 This substantially reduces Cross-Encoder computation while preserving semantic recall.
 
-Each selected candidate chunk is then jointly encoded with its corresponding JD chunk using a Cross-Encoder, producing significantly more accurate pairwise relevance estimates than independent embeddings.
-
-The Cross-Encoder score is softly calibrated using agreement across the three retrieval signals:
+When the Cross-Encoder returns logits, they are centered and converted to probabilities:
 
 $$
-agreement = \mathrm{clip}\!\left(1 - \frac{|ce-bi| + |ce-bm25| + |bi-bm25|}{3},\,0,\,1\right)
+p=\sigma\!\left(\frac{z-\beta}{T}\right)
+$$
+
+where:
+
+* $z$ is the raw Cross-Encoder logit,
+* $\beta$ is the median finite shortlist logit when logits are available,
+* $T$ is the calibration temperature.
+
+The temperature is chosen from the shortlist spread when enough finite logits exist, and the result is clipped to $[10^{-4},\,1-10^{-4}]$ for numerical stability.
+
+The Cross-Encoder contribution is then softly adjusted using an agreement-based Smart Multiplier:
+
+$$
+a=\max\left(0,\min\left(1,1-\frac{|c-v|+|c-l|+|v-l|}{3}\right)\right)
 $$
 
 $$
-smart\_multiplier = 0.90 + 0.10\times agreement
+m=0.90+0.10a
 $$
 
-The calibrated Cross-Encoder contribution is then adjusted with the negative evidence penalty:
+$$
+c_{\mathrm{adj}}=c\,m\,e^{-2.4\max(0,n)}
+$$
 
-$$
-ce\_adjusted = ce \times smart\_multiplier \times \exp(-2.4 \times \max(0, cross\_neg))
-$$
+where $c$ is the Cross-Encoder score, $v$ is the Bi-Encoder score, $l$ is the BM25 score, and $n$ is the negative evidence confidence.
 
 The semantic fusion stage then applies a small consensus-aware calibration around the base retrieval blend:
 
 $$
-semantic\_proxy = \mathrm{clamp01}(semantic\_boost)^{0.92}
+\mathbf{w}_0=[0.55,\,0.25,\,0.20]
 $$
 
 $$
-fusion\_base = [0.55, 0.25, 0.20]
+\hat{\mathbf{r}}=\frac{[r_c,\,r_v,\,r_l]}{\lVert[r_c,\,r_v,\,r_l]\rVert_1}
 $$
 
 $$
-reliability\_weights = \mathrm{normalize}\left(e^{-4|s_i-\bar{s}|}\right)
+\hat{\mathbf{w}}=\frac{0.92\,\mathbf{w}_0+0.08\,\hat{\mathbf{r}}}{\lVert0.92\,\mathbf{w}_0+0.08\,\hat{\mathbf{r}}\rVert_1}
 $$
 
 $$
-fusion\_weights = \mathrm{normalize}(0.92 \cdot fusion\_base + 0.08 \cdot reliability\_weights)
+S=\hat{w}_1 c_{\mathrm{adj}}+\hat{w}_2 v+\hat{w}_3 l
 $$
 
-$$
-semantic\_core = fusion\_weights \cdot [ce\_adjusted, semantic\_proxy, bm25\_proxy]
-$$
-
-Finally, the strongest semantic matches are separated slightly more using an upper-tail stretch:
+The resulting semantic score is then stretched only in the upper tail so the strongest matches separate a little more without changing the ordering of the rest of the scale:
 
 $$
-semantic\_core = \mathrm{stretch\_upper\_tail}(semantic\_core,\ threshold=0.75,\ gamma=0.92)
+S'=
+\begin{cases}
+S, & S\le 0.75 \\
+0.75+0.25\left(\dfrac{S-0.75}{0.25}\right)^{0.92}, & S>0.75
+\end{cases}
 $$
 
 ---
 
-## Stage 7 — Quality-based Coverage
+## Stage 7 — Coverage Quality
 
 Coverage measures how completely a candidate satisfies the conceptual areas represented within the job description.
 
 Rather than counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score:
 
 $$
-quality=\frac{\sum_i w_i \cdot Best_i}{\sum_i w_i}
+q=\frac{\sum_i w_i\,Best_i}{\sum_i w_i}
 $$
 
 where:
@@ -326,12 +344,14 @@ where:
 That quality signal is blended with family breadth and then turned into a bounded bonus:
 
 $$
-breadth=\frac{\lvert families\_hit\rvert}{7}
+b=\frac{|F|}{7}
 $$
 
 $$
-Coverage = 0.06 \times \sigma\!\left((0.80 \times quality + 0.20 \times breadth - 0.45)\times 6.0\right)
+C=0.06\times\sigma\!\left(6.0\,(0.80q+0.20b-0.45)\right)
 $$
+
+where $F$ is the set of families hit.
 
 This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
 
@@ -346,11 +366,11 @@ Instead of rewarding numerous weak matches, only the strongest semantic evidence
 The score is computed from the strongest three positive chunks using fixed emphasis coefficients $\alpha=[0.5,0.3,0.2]$:
 
 $$
-E=\frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
+z=\frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
 $$
 
 $$
-Evidence = 0.06 \times \sigma\!\left((E - 0.45)\times 6.5\right)
+D=0.06\times\sigma\!\left(6.5\,(z-0.45)\right)
 $$
 
 where:
@@ -371,16 +391,18 @@ Potential recruiter risks—including wrapper-only experience, research-only bac
 The negative families are aggregated into a single confidence value:
 
 $$
-negative\_confidence = \frac{negative\_strength}{negative\_strength + positive\_strength + 0.20}
+n=\frac{g}{g+h+0.20}
 $$
+
+where $g$ is negative strength and $h$ is positive strength.
 
 The downstream penalty is then applied as:
 
 $$
-penalty =
+P_{\mathrm{neg}}=
 \begin{cases}
-1.0, & negative\_confidence \le 0.18 \\
-e^{-2.40\,(negative\_confidence - 0.18)}, & negative\_confidence > 0.18
+1.0, & n\le 0.18 \\
+e^{-2.4\,(n-0.18)}, & n>0.18
 \end{cases}
 $$
 
@@ -395,11 +417,11 @@ The final score combines semantic relevance, behavior signals, coverage, evidenc
 The final ranking formula in the current code is:
 
 $$
-final\_raw = 0.72 \times semantic\_core + 0.17 \times behavior\_boost + Coverage + Evidence
+F_{\mathrm{raw}}=0.72\,S' + 0.17\,(BVS-0.5) + C + D
 $$
 
 $$
-final\_score = final\_raw \times negative\_confidence\_penalty(negative\_confidence)
+F_{\mathrm{score}}=F_{\mathrm{raw}}\times P_{\mathrm{neg}}
 $$
 
 This keeps semantic relevance dominant, while behavior, coverage, evidence, and negative confidence act as bounded refinements instead of replacing the core retrieval signal.
