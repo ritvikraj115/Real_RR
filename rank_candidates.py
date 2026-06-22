@@ -1349,57 +1349,64 @@ def load_jd_index(path: Path) -> list[Chunk]:
     return chunks
 
 
+
 def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
     """Yield candidate objects from JSON, JSONL, or gzipped JSON/JSONL.
 
     The hackathon sample tooling sometimes renames pretty-printed JSON to *.jsonl.
-    We first try to parse the whole file as JSON, then fall back to line-delimited
-    parsing so both formats are accepted safely.
+    We first try to parse a JSON container, then fall back to streaming JSONL
+    parsing so both formats are accepted safely without loading the entire file
+    into memory.
     """
-    suffix = path.suffix.lower()
     is_gz = path.name.lower().endswith(".gz")
 
-    if is_gz:
-        import gzip as _gzip  # local import keeps the dependency optional
-        with _gzip.open(path, "rt", encoding="utf-8") as f:
-            raw_text = f.read()
-    else:
-        with path.open("r", encoding="utf-8") as f:
-            raw_text = f.read()
+    opener = gzip.open if is_gz else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        # Peek the first non-whitespace character to decide whether the file is
+        # probably a JSON container or JSONL. Rewind immediately so the parser
+        # sees the full stream.
+        start_pos = f.tell()
+        first_char = ""
+        while True:
+            ch = f.read(1)
+            if not ch:
+                return
+            if not ch.isspace():
+                first_char = ch
+                break
+        f.seek(start_pos)
 
-    raw_text = raw_text.strip()
-    if not raw_text:
-        return
+        def yield_from_parsed(data: Any) -> Iterable[dict[str, Any]]:
+            if isinstance(data, list):
+                yield from data
+            elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
+                yield from data["candidates"]
+            elif isinstance(data, dict) and data.get("candidate_id"):
+                yield data
+            else:
+                raise ValueError(f"Unsupported candidate JSON structure in {path}")
 
-    def yield_from_parsed(data: Any) -> Iterable[dict[str, Any]]:
-        if isinstance(data, list):
-            yield from data
-        elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
-            yield from data["candidates"]
-        elif isinstance(data, dict) and data.get("candidate_id"):
-            yield data
+        # If the file looks like JSON, try the fast container parser first.
+        if first_char in "[{":
+            try:
+                parsed = json.load(f)
+            except json.JSONDecodeError:
+                f.seek(start_pos)
+            else:
+                yield from yield_from_parsed(parsed)
+                return
         else:
-            raise ValueError(f"Unsupported candidate JSON structure in {path}")
+            f.seek(start_pos)
 
-    # First try a single JSON object / array. This handles pretty-printed JSON
-    # that may have been saved with a .jsonl extension by the sandbox UI.
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        parsed = None
-    if parsed is not None:
-        yield from yield_from_parsed(parsed)
-        return
-
-    # Fall back to strict JSONL parsing.
-    for line_no, line in enumerate(raw_text.splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+        # Fall back to strict streaming JSONL parsing.
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
 
 
 def build_candidate_text(candidate: dict[str, Any], as_of_date: date | None = None) -> list[str]:
