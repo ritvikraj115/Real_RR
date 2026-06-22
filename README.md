@@ -152,21 +152,21 @@ No semantic matching is performed at this stage. That keeps the filter fast and 
 
 ## Stage 2 — Behavior Validation Score (BVS)
 
-Each remaining candidate receives a **Behavior Validation Score (BVS)** that measures recruiter-oriented profile quality independently of semantic relevance.
+Each remaining candidate receives a **Behavior Validation Score (BVS)** from structured hiring signals.
 
-The score combines structured hiring signals including:
+The raw score is shaped with:
 
-* recruiter responsiveness
-* assessment performance
-* interview completion
-* notice period
-* experience alignment
-* profile quality
-* verification status
-* market engagement
-* recruiter activity
+$$
+\mathrm{shape\_bvs\_score}(x)=\mathrm{clip}\left(0.02 + 0.96\,\sigma\!\left((x-0.50)\times 4.20\right),\,0,\,1\right)
+$$
 
-Rather than assigning fixed scores, BVS is calibrated using percentile normalization and smooth score shaping. This keeps the score spread meaningful while avoiding saturation near the top end.
+Then the downstream BVS is blended with a percentile-stretched version of itself:
+
+$$
+\mathrm{BVS} = (1-0.34)\times raw\_bvs + 0.34\times stretch\_bvs\_percentile\bigl(percentile\_rank(raw\_bvs)\bigr)
+$$
+
+This keeps the score spread meaningful while reducing top-end compression.
 
 ---
 
@@ -248,13 +248,27 @@ $$
 where:
 
 * \(z\) is the raw Cross-Encoder logit,
-* \(b\) is the median shortlist logit used for bias correction,
+* \(b\) is the median finite shortlist logit when logits are available,
 * \(T\) is the calibration temperature,
 * \(\sigma\) denotes the sigmoid function.
 
-Only a single sigmoid transformation is applied.
+If the shortlist has at least five finite logits, the code uses \(T=\max(3.50,\,0.5\times(p90-p10))\); otherwise it uses \(T=3.50\). If the model already returns probabilities, the fallback is \(\sigma((z-0.0)/3.50)\). The result is clipped to \([10^{-4},\,1-10^{-4}]\).
 
-The Cross-Encoder score is then softly adjusted using an agreement-based Smart Multiplier. The multiplier stays close to 1.0 and nudges the Cross-Encoder contribution only when BM25, the Bi-Encoder, and the Cross-Encoder are in stronger agreement. A small negative-evidence risk penalty is also applied to the Cross-Encoder contribution before semantic fusion, so isolated risky chunks do not dominate the final score.
+The Cross-Encoder contribution is then softly adjusted using an agreement-based Smart Multiplier:
+
+$$
+agreement = \mathrm{clip}\!\left(1 - \frac{|ce-bi| + |ce-bm25| + |bi-bm25|}{3},\,0,\,1\right)
+$$
+
+$$
+smart\_multiplier = 0.90 + 0.10\times agreement
+$$
+
+$$
+ce\_adjusted = ce\_tech \times smart\_multiplier \times e^{-2.4\times cross\_neg}
+$$
+
+This keeps the Cross-Encoder close to the original score while gently discounting disagreement and risky negative evidence.
 
 The strongest semantic evidence is then aggregated using a consistency-aware formulation:
 
@@ -274,7 +288,7 @@ Coverage measures how completely a candidate satisfies the conceptual areas repr
 Rather than counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score:
 
 $$
-Coverage = \frac{\sum_i w_i\cdot Best_i}{\sum_i w_i}
+quality = \frac{\sum_i w_i\cdot Best_i}{\sum_i w_i}
 $$
 
 where:
@@ -282,9 +296,15 @@ where:
 * \(Best_i\) is the strongest semantic similarity observed for family \(i\),
 * \(w_i\) is the corresponding JD importance weight.
 
-This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
+That quality signal is blended with family breadth and then turned into a bounded bonus:
 
-Coverage is kept as a small bounded bonus, so it refines the semantic ranking instead of replacing it.
+$$
+Coverage = 0.06\times \sigma\!\left((0.80\times quality + 0.20\times breadth - 0.45)\times 6.0\right)
+$$
+
+where \(breadth = |families\_hit| / 7\).
+
+This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
 
 ---
 
@@ -295,11 +315,14 @@ Evidence Density measures the consistency of supporting semantic evidence throug
 
 Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes. The implementation also uses JD weights so high-importance evidence matters more than low-importance evidence.
 
-The evidence score is computed from the strongest three positive chunks using fixed emphasis coefficients \(\alpha=[0.5,0.3,0.2]\):
+The score is computed from the strongest three positive chunks using fixed emphasis coefficients \(\alpha=[0.5,0.3,0.2]\):
 
 $$
-Evidence=
-\frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
+E = \frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
+$$
+
+$$
+Evidence = 0.06\times \sigma\!\left((E - 0.45)\times 6.5\right)
 $$
 
 where:
@@ -311,14 +334,28 @@ The three evidence chunks are selected with a light JD-weight-aware preference b
 
 This keeps the score focused on the strongest evidence while still respecting JD importance and consistency.
 
-Evidence is also kept as a small bounded bonus so it improves ranking stability without overpowering semantic relevance.
-
 ---
 
 
 ## Stage 9 — Negative Confidence
 
 Potential recruiter risks—including wrapper-only experience, research-only backgrounds, or weak production evidence—are summarized into a calibrated Negative Confidence score.
+
+The negative families are aggregated into a single confidence value:
+
+$$
+negative\_confidence = \frac{negative\_strength}{negative\_strength + positive\_strength + 0.20}
+$$
+
+The downstream penalty is then applied as:
+
+$$
+penalty =
+\begin{cases}
+1.0, & negative\_confidence \le 0.18 \\
+e^{-2.40\,(negative\_confidence - 0.18)}, & negative\_confidence > 0.18
+\end{cases}
+$$
 
 Rather than applying hard penalties, multiple negative signals are aggregated into a confidence estimate. That keeps the system explainable and reduces false penalties from isolated keywords.
 
@@ -335,19 +372,39 @@ $$
 [0.55,\;0.25,\;0.20]
 $$
 
-and is nudged by a small reliability-centered adjustment derived from agreement between the Cross-Encoder, Bi-Encoder, and BM25 proxies. In practice, this keeps the ensemble close to the original design while giving slightly more trust to the signals that agree better on a given candidate.
+The code then computes:
+
+$$
+semantic\_proxy = semantic\_boost^{0.92}
+$$
+
+$$
+reliability\_weights = normalize\!\left(e^{-4\,|signal - mean(signal)|}\right)
+$$
+
+$$
+fusion\_weights = normalize\!\left(0.92\times[0.55,0.25,0.20] + 0.08\times reliability\_weights\right)
+$$
+
+$$
+semantic\_core = fusion\_weights \cdot [ce\_adjusted,\,semantic\_proxy,\,bm25\_proxy]
+$$
+
+$$
+semantic\_core = stretch\_upper\_tail(semantic\_core,\,threshold=0.75,\,gamma=0.92)
+$$
 
 The final ranking score combines:
 
-* semantic relevance
-* quality-based coverage
-* evidence density
-* Behavior Validation Score (BVS)
-* calibrated negative confidence
+$$
+final\_raw = 0.72\times semantic\_core + 0.17\times(BVS - 0.5) + coverage\_bonus + evidence\_bonus
+$$
 
-into a single explainable ranking function.
+$$
+final\_score = final\_raw \times negative\_confidence\_penalty(negative\_confidence)
+$$
 
-Each component measures a distinct aspect of candidate quality, minimizing duplicated signals while producing stable and interpretable rankings.
+This keeps the ensemble close to the original design while giving slightly more trust to the signals that agree better on a given candidate.
 
 ---
 
