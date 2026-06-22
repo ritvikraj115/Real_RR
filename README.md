@@ -28,16 +28,16 @@ Rather than relying on a single ranking signal, the system combines **structured
 
 The pipeline was developed and validated using the following environment.
 
-| Component        | Version         |
+| Component | Version |
 | ---------------- | --------------- |
-| Python           | **3.12.x**      |
-| Execution        | CPU Only        |
+| Python | **3.12.x** |
+| Execution | CPU Only |
 | Operating System | Windows / Linux |
-| GPU              | Not Required    |
+| GPU | Not Required |
 
 > **Important**
 >
-> The project was developed and tested using **Python 3.12**. Some combinations of **PyTorch**, **Transformers**, and **Sentence-Transformers** may exhibit compatibility issues on older Python versions. For reproducible results, we recommend running the project with **Python 3.12**.
+> The project was developed and tested using **Python 3.12**. Some combinations of **PyTorch**, **Transformers**, and **Sentence-Transformers** may behave differently on older Python versions. For reproducible results, we recommend running the project with **Python 3.12**.
 
 ---
 
@@ -46,12 +46,10 @@ The pipeline was developed and validated using the following environment.
 We recommend using a clean virtual environment.
 
 ```bash
-#Clone Repo
-
+# Clone the repo
 git clone https://github.com/ritvikraj115/Real_RR.git
 
 # Create virtual environment (Python 3.12)
-
 py -3.12 -m venv .venv
 
 # Activate
@@ -63,7 +61,6 @@ source .venv/bin/activate
 .\.venv\Scripts\activate
 
 # Install dependencies
-
 pip install -r requirements.txt
 ```
 
@@ -91,7 +88,7 @@ python validate_submission.py Real_RR.csv
 
 # Pipeline Overview
 
-The ranking pipeline progressively reduces the candidate search space while applying increasingly sophisticated evaluation methods. Earlier stages efficiently remove obvious mismatches, whereas later stages perform computationally expensive semantic verification only on the strongest candidates.
+The ranking pipeline progressively reduces the candidate search space while applying increasingly sophisticated evaluation methods. Earlier stages remove obvious mismatches quickly, while later stages spend more compute only on the strongest candidates.
 
 ```text
 L0 Structured Triage
@@ -149,7 +146,7 @@ Only candidates with clear eligibility mismatches are removed using structured r
 * profile completeness
 * structured hiring attributes
 
-No semantic matching is performed at this stage, allowing the pipeline to significantly reduce the search space while minimizing false negatives.
+No semantic matching is performed at this stage. That keeps the filter fast and conservative, so the system reduces the search space while minimizing false negatives.
 
 ---
 
@@ -169,7 +166,7 @@ The score combines structured hiring signals including:
 * market engagement
 * recruiter activity
 
-Rather than assigning fixed scores, BVS is calibrated using percentile normalization and smooth score shaping to preserve meaningful discrimination while preventing score saturation.
+Rather than assigning fixed scores, BVS is calibrated using percentile normalization and smooth score shaping. This keeps the score spread meaningful while avoiding saturation near the top end.
 
 ---
 
@@ -199,8 +196,6 @@ This stage captures:
 * implementation-specific skills
 * domain vocabulary
 
----
-
 ### Dense Vector Retrieval (Bi-Encoder)
 
 Candidate narratives and JD chunks are encoded using a Sentence Transformer Bi-Encoder.
@@ -211,7 +206,7 @@ $$
 \mathrm{CosSim}(x,y)=\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
 $$
 
-allowing semantically similar concepts to match even when different terminology is used.
+This allows semantically similar concepts to match even when different terminology is used.
 
 ---
 
@@ -244,16 +239,16 @@ This substantially reduces Cross-Encoder computation while preserving semantic r
 
 Each selected candidate chunk is then jointly encoded with its corresponding JD chunk using a Cross-Encoder, producing significantly more accurate pairwise relevance estimates than independent embeddings.
 
-When the Cross-Encoder returns logits, confidence calibration is applied before conversion to probabilities:
+When the Cross-Encoder returns logits, they are centered and calibrated before conversion to probabilities:
 
 $$
-p = \sigma\!\left(\frac{z-b}{T}\right)
+p=\sigma\!\left(\frac{z-b}{T}\right)
 $$
 
-where
+where:
 
 * \(z\) is the raw Cross-Encoder logit,
-* \(b\) is the median logit used for bias correction,
+* \(b\) is the median shortlist logit used for bias correction,
 * \(T\) is the calibration temperature,
 * \(\sigma\) denotes the sigmoid function.
 
@@ -279,7 +274,7 @@ $$
 Coverage = \frac{\sum_i w_i\cdot Best_i}{\sum_i w_i}
 $$
 
-where
+where:
 
 * \(Best_i\) is the strongest semantic similarity observed for family \(i\),
 * \(w_i\) is the corresponding JD importance weight.
@@ -292,13 +287,24 @@ This rewards both semantic quality and conceptual breadth while avoiding duplica
 
 Evidence Density measures the consistency of supporting semantic evidence throughout the candidate profile.
 
-Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes:
+Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes. The implementation now also uses JD weights so high-importance evidence matters more than low-importance evidence.
+
+A compact view of the score is:
 
 $$
-Evidence = 0.7\times\max(\text{Top3}) + 0.3\times\mathrm{mean}(\text{Top3})
+Evidence=
+\frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
+\qquad
+\text{with }
+\alpha=[0.5,0.3,0.2]
 $$
 
-encouraging candidates who consistently demonstrate strong relevance across multiple supporting passages.
+where:
+
+* \(S_i\) is the Cross-Encoder score for the selected evidence,
+* \(w_i\) is the corresponding JD chunk weight.
+
+This keeps the score focused on the strongest evidence while still respecting JD importance and consistency.
 
 ---
 
@@ -306,23 +312,15 @@ encouraging candidates who consistently demonstrate strong relevance across mult
 
 Potential recruiter risks—including wrapper-only experience, research-only backgrounds, or weak production evidence—are summarized into a calibrated Negative Confidence score.
 
-Rather than applying hard penalties, multiple negative signals are aggregated into a confidence estimate, reducing false penalties from isolated keywords while maintaining explainability.
+Rather than applying hard penalties, multiple negative signals are aggregated into a confidence estimate. That keeps the system explainable and reduces false penalties from isolated keywords.
 
 ---
 
 ## Stage 10 — Final Score Fusion
 
-Semantic relevance is computed as:
+Semantic relevance is computed using an adaptive reliability-weighted fusion of the three retrieval signals. The weights shift slightly based on agreement while still summing to 1.0.
 
-$$
-Semantic = 0.55\times CE_{adj} + 0.25\times BE + 0.20\times BM25
-$$
-
-where
-
-* \(CE_{adj}\) is the confidence-calibrated Cross-Encoder score,
-* \(BE\) is the Bi-Encoder similarity,
-* \(BM25\) is the lexical relevance score.
+In practice, the model still starts from the same semantic sources, but the contribution of each source is nudged by how consistent it is with the others.
 
 The final ranking score combines:
 
