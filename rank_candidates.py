@@ -274,6 +274,20 @@ def sigmoid(values: np.ndarray | float) -> np.ndarray | float:
     return out.astype(np.float32)
 
 
+
+
+def stretch_upper_tail(value: float, threshold: float = 0.75, gamma: float = 0.92) -> float:
+    """Monotonic upper-tail calibration that only stretches high scores."""
+    x = clamp01(float(value))
+    threshold = clamp01(float(threshold))
+    gamma = max(1e-6, float(gamma))
+    if x <= threshold:
+        return x
+    span = max(1e-6, 1.0 - threshold)
+    scaled = (x - threshold) / span
+    stretched = threshold + span * float(np.power(clamp01(scaled), gamma))
+    return clamp01(stretched)
+
 def percentile_rank(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
@@ -905,9 +919,9 @@ def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float,
     if not hits:
         return 0.0, 0.0, 0
 
-    # Keep the strongest three evidence chunks, but rank them with a light
-    # JD-weight-aware preference so important chunks can edge out weaker ones.
-    hits.sort(key=lambda item: (item[0] * item[1], item[0]), reverse=True)
+    # Keep the strongest three evidence chunks, but rank them with a softened
+    # JD-weight-aware preference so important chunks help without overpowering CE quality.
+    hits.sort(key=lambda item: (item[0] * math.sqrt(max(item[1], 1e-6)), item[0]), reverse=True)
     top_hits = hits[:3]
 
     alpha = (0.5, 0.3, 0.2)
@@ -2389,6 +2403,7 @@ def chunk_label(chunk: Chunk) -> str:
     return text.rstrip(".")
 
 
+
 def make_reasoning(
     candidate: CandidateRecord,
     chunks: list[Chunk],
@@ -2407,9 +2422,10 @@ def make_reasoning(
     pos.sort(reverse=True)
     neg.sort(reverse=True)
 
-    parts: list[str] = []
     candidate_text = candidate.candidate_text
+
     positive_bits: list[str] = []
+    positive_families: list[str] = []
     for _, idx in pos[:4]:
         chunk = chunks[idx]
         snippet = first_evidence_snippet(candidate_text, list(chunk.terms) + tokenize(chunk.bm25_query), reverse=True)
@@ -2417,28 +2433,95 @@ def make_reasoning(
             positive_bits.append(f"{chunk.id}: {snippet}")
         elif len(positive_bits) < 2:
             positive_bits.append(f"{chunk.id}: narrative match for {chunk_label(chunk)}")
-        if len(positive_bits) >= 2:
+        positive_families.append(chunk_family(chunk.id))
+        if len(positive_bits) >= 3:
             break
-    if positive_bits:
-        parts.append("semantic positives: " + "; ".join(positive_bits))
-
-    if candidate.bvs_strengths:
-        parts.append("l0_strengths: " + "; ".join(candidate.bvs_strengths[:3]))
 
     penalty_bits: list[str] = []
     for _, idx in neg[:3]:
         chunk = chunks[idx]
-        penalty_bits.append(f"{chunk.id}: Penalty for {chunk_label(chunk)}")
+        penalty_bits.append(f"{chunk.id}: penalty for {chunk_label(chunk)}")
         if len(penalty_bits) >= 1:
             break
     penalty_bits.extend(candidate.bvs_penalties[:2])
-    if penalty_bits:
-        parts.append("penalties: " + "; ".join(penalty_bits[:3]))
 
-    return " | ".join(parts)[:900] if parts else "No concise evidence available from candidate narrative or structured fields."
+    strength_text = " ".join((candidate.bvs_strengths[:3] or [])).lower()
+    top_family = positive_families[0] if positive_families else "UNKNOWN"
+    family_count = len(set(positive_families))
+    evidence_count = len(positive_bits)
+
+    if top_family in {"SYSTEMS", "PRODUCT", "ADVANCED"} or any(term in strength_text for term in ("production", "deployed", "shipped", "launched", "latency", "throughput")):
+        opening_templates = [
+            "Strong production-oriented alignment is visible in the candidate's most relevant evidence.",
+            "Excellent production and systems alignment stands out in the strongest evidence.",
+            "A production-heavy profile emerges clearly from the top-ranked evidence.",
+        ]
+    elif family_count >= 4:
+        opening_templates = [
+            "Broad coverage across the job requirements makes this a well-rounded match.",
+            "The candidate covers several JD families, which suggests a balanced fit.",
+            "Multiple JD families are represented, giving this profile good breadth.",
+        ]
+    elif evidence_count >= 2:
+        opening_templates = [
+            "Consistent supporting evidence reinforces the semantic match.",
+            "Multiple independent passages point to the same relevance signal.",
+            "The strongest evidence is repeated across more than one supporting passage.",
+        ]
+    elif candidate.bvs_strengths:
+        opening_templates = [
+            "A strong recruiter-oriented profile complements the semantic match.",
+            "Behavioral signals make this a smoother hiring profile.",
+            "Recruiter-side signals strengthen an already relevant candidate.",
+        ]
+    else:
+        opening_templates = [
+            "Strong semantic alignment with the job requirements is visible in the candidate narrative.",
+            "The candidate shows clear semantic alignment with the role requirements.",
+            "Semantic fit is the main signal here, supported by candidate narrative evidence.",
+        ]
+
+    opener = opening_templates[sum(ord(ch) for ch in candidate.candidate_id) % len(opening_templates)]
+
+    sentences: list[str] = [opener]
+
+    if positive_bits:
+        sentences.append(
+            "Key supporting evidence includes "
+            + "; ".join(positive_bits[:3])
+            + "."
+        )
+
+    if family_count:
+        if family_count >= 4:
+            coverage_sentence = "Coverage spans several JD families, so the match is not isolated to one topic."
+        elif family_count == 3:
+            coverage_sentence = "Coverage is balanced across multiple JD families."
+        elif family_count == 2:
+            coverage_sentence = "Coverage reaches more than one JD family, which improves confidence."
+        else:
+            coverage_sentence = "Coverage is concentrated in one strong JD family."
+        sentences.append(coverage_sentence)
+
+    if candidate.bvs_strengths:
+        strengths = [
+            s.replace("_", " ").replace("=", ": ")
+            for s in candidate.bvs_strengths[:3]
+        ]
+        sentences.append("Behavioral signals add support through " + "; ".join(strengths) + ".")
+
+    if penalty_bits:
+        penalties = [p.replace("_", " ") for p in penalty_bits[:3]]
+        sentences.append("A small caution remains around " + "; ".join(penalties) + ".")
+
+    if not positive_bits and not candidate.bvs_strengths and not penalty_bits:
+        return "No concise evidence available from candidate narrative or structured fields."
+
+    return " ".join(sentences)[:900]
 
 
 def write_top_output(
+
     path: Path,
     ranked: list[int],
     final_scores: np.ndarray,
@@ -2775,7 +2858,7 @@ def run(args: argparse.Namespace) -> int:
     for offset, cand_idx in enumerate(shortlist):
         ce_tech = float(cross_scores_shortlist[offset])
         semantic_boost = float(semantic_final_norm[cand_idx])
-        behavior_boost = float(bvs_scores[cand_idx])
+        behavior_boost = float(bvs_scores[cand_idx]) - 0.5
 
         adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
         coverage_bonus, coverage_quality, family_hits = positive_family_coverage_bonus(adjusted_row, chunks)
@@ -2815,22 +2898,38 @@ def run(args: argparse.Namespace) -> int:
         ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
         ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
 
-        # Adaptive reliability-weighted semantic fusion: weights shift only slightly
-        # around the original design while staying normalized and bounded.
+        # Adaptive reliability-weighted semantic fusion: keep the base mix stable,
+        # but apply only a small consensus-aware calibration to the three retrieval signals.
+        semantic_proxy = float(math.pow(clamp01(semantic_boost), 0.92))
         fusion_base = np.asarray([0.55, 0.25, 0.20], dtype=np.float32)
-        fusion_signals = np.asarray([ce_adjusted, semantic_boost, behavior_boost], dtype=np.float32)
-        signal_reliability = np.asarray([
-            1.0 - (abs(ce_proxy - bi_proxy) + abs(ce_proxy - bm25_proxy)) / 2.0,
-            1.0 - (abs(bi_proxy - ce_proxy) + abs(bi_proxy - bm25_proxy)) / 2.0,
-            1.0 - (abs(bm25_proxy - ce_proxy) + abs(bm25_proxy - bi_proxy)) / 2.0,
-        ], dtype=np.float32)
-        signal_reliability = np.clip(signal_reliability, 0.0, 1.0)
-        reliability_centered = signal_reliability - float(np.mean(signal_reliability))
-        fusion_weights = fusion_base + (0.03 * reliability_centered)
-        base_score = float(np.dot(fusion_weights, fusion_signals))
+        fusion_signals = np.asarray([ce_adjusted, semantic_proxy, bm25_proxy], dtype=np.float32)
 
-        # Keep coverage and evidence as genuine bonuses rather than a re-ranking cliff.
-        final_raw = base_score + coverage_bonus + evidence_bonus
+        signal_proxies = np.asarray([
+            ce_proxy,
+            semantic_proxy,
+            bm25_proxy,
+        ], dtype=np.float32)
+        consensus = float(np.mean(signal_proxies))
+        deviation = np.abs(signal_proxies - consensus)
+        raw_reliability = np.exp(-4.0 * deviation)
+        raw_reliability = np.clip(raw_reliability, 1e-6, None)
+        reliability_weights = raw_reliability / float(np.sum(raw_reliability))
+
+        # Keep shifts small so the ensemble remains stable and close to the
+        # original 0.55 / 0.25 / 0.20 blend.
+        fusion_weights = (0.92 * fusion_base) + (0.08 * reliability_weights)
+        fusion_weights = fusion_weights / float(np.sum(fusion_weights))
+        semantic_core = float(np.dot(fusion_weights, fusion_signals))
+
+        # Stretch only the upper tail so the strongest semantic matches separate
+        # a little more without changing the ordering or the rest of the scale.
+        semantic_core = stretch_upper_tail(semantic_core, threshold=0.75, gamma=0.92)
+
+        # BVS remains a centered refinement signal, not a raw positive offset.
+        bvs_bonus = 0.17 * behavior_boost
+
+        # Coverage and evidence stay as small bounded refinements.
+        final_raw = (0.72 * semantic_core) + bvs_bonus + coverage_bonus + evidence_bonus
 
         # Narrative negative confidence acts as a calibrated risk penalty.
         narrative_penalty = negative_confidence_penalty(negative_conf)
