@@ -12,6 +12,7 @@ Rather than relying on a single ranking signal, the system combines **structured
 
 ```text
 .
+├── .streamlit/                     # Streamlit Configurations
 ├── models/                         # Cached SentenceTransformer and Cross-Encoder models
 ├── app.py                          # Optional Streamlit demonstration
 ├── jd_hybrid_index.json            # Preprocessed hybrid JD index
