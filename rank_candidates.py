@@ -905,7 +905,9 @@ def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float,
     if not hits:
         return 0.0, 0.0, 0
 
-    hits.sort(key=lambda item: item[0], reverse=True)
+    # Keep the strongest three evidence chunks, but rank them with a light
+    # JD-weight-aware preference so important chunks can edge out weaker ones.
+    hits.sort(key=lambda item: (item[0] * item[1], item[0]), reverse=True)
     top_hits = hits[:3]
 
     alpha = (0.5, 0.3, 0.2)
@@ -2813,8 +2815,8 @@ def run(args: argparse.Namespace) -> int:
         ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
         ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
 
-        # Adaptive reliability-weighted semantic fusion: weights shift slightly with agreement
-        # while staying normalized and keeping CE the dominant signal.
+        # Adaptive reliability-weighted semantic fusion: weights shift only slightly
+        # around the original design while staying normalized and bounded.
         fusion_base = np.asarray([0.55, 0.25, 0.20], dtype=np.float32)
         fusion_signals = np.asarray([ce_adjusted, semantic_boost, behavior_boost], dtype=np.float32)
         signal_reliability = np.asarray([
@@ -2823,12 +2825,8 @@ def run(args: argparse.Namespace) -> int:
             1.0 - (abs(bm25_proxy - ce_proxy) + abs(bm25_proxy - bi_proxy)) / 2.0,
         ], dtype=np.float32)
         signal_reliability = np.clip(signal_reliability, 0.0, 1.0)
-        fusion_weights = fusion_base * (0.85 + 0.15 * signal_reliability)
-        fusion_weight_sum = float(np.sum(fusion_weights))
-        if fusion_weight_sum > 0.0:
-            fusion_weights = fusion_weights / fusion_weight_sum
-        else:
-            fusion_weights = fusion_base
+        reliability_centered = signal_reliability - float(np.mean(signal_reliability))
+        fusion_weights = fusion_base + (0.03 * reliability_centered)
         base_score = float(np.dot(fusion_weights, fusion_signals))
 
         # Keep coverage and evidence as genuine bonuses rather than a re-ranking cliff.
