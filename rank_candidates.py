@@ -1348,65 +1348,58 @@ def load_jd_index(path: Path) -> list[Chunk]:
         raise ValueError(f"Expected scoreable chunks C01-C24, found {found}")
     return chunks
 
-
-
 def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
-    """Yield candidate objects from JSON, JSONL, or gzipped JSON/JSONL.
+    """Yield candidate objects from JSONL or JSON files.
 
-    The hackathon sample tooling sometimes renames pretty-printed JSON to *.jsonl.
-    We first try to parse a JSON container, then fall back to streaming JSONL
-    parsing so both formats are accepted safely without loading the entire file
-    into memory.
+    For real JSONL files, stream line by line so the first run does not stall.
+    For .json / .json.gz, parse the whole JSON document once.
     """
     is_gz = path.name.lower().endswith(".gz")
+    suffix = path.suffix.lower()
 
-    opener = gzip.open if is_gz else open
-    with opener(path, "rt", encoding="utf-8") as f:
-        # Peek the first non-whitespace character to decide whether the file is
-        # probably a JSON container or JSONL. Rewind immediately so the parser
-        # sees the full stream.
-        start_pos = f.tell()
-        first_char = ""
-        while True:
-            ch = f.read(1)
-            if not ch:
-                return
-            if not ch.isspace():
-                first_char = ch
-                break
-        f.seek(start_pos)
+    def open_text_file():
+        if is_gz:
+            import gzip as _gzip
+            return _gzip.open(path, "rt", encoding="utf-8")
+        return path.open("r", encoding="utf-8")
 
-        def yield_from_parsed(data: Any) -> Iterable[dict[str, Any]]:
-            if isinstance(data, list):
-                yield from data
-            elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
-                yield from data["candidates"]
-            elif isinstance(data, dict) and data.get("candidate_id"):
-                yield data
-            else:
-                raise ValueError(f"Unsupported candidate JSON structure in {path}")
-
-        # If the file looks like JSON, try the fast container parser first.
-        if first_char in "[{":
-            try:
-                parsed = json.load(f)
-            except json.JSONDecodeError:
-                f.seek(start_pos)
-            else:
-                yield from yield_from_parsed(parsed)
-                return
+    def emit_container(data: Any) -> Iterable[dict[str, Any]]:
+        if isinstance(data, list):
+            yield from data
+        elif isinstance(data, dict) and isinstance(data.get("candidates"), list):
+            yield from data["candidates"]
+        elif isinstance(data, dict) and data.get("candidate_id"):
+            yield data
         else:
-            f.seek(start_pos)
+            raise ValueError(f"Unsupported candidate JSON structure in {path}")
 
-        # Fall back to strict streaming JSONL parsing.
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+    # Fast path for JSONL: stream line by line, never read the whole file.
+    if suffix == ".jsonl" or path.name.lower().endswith(".jsonl.gz"):
+        with open_text_file() as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+
+                if isinstance(obj, dict):
+                    yield obj
+                elif isinstance(obj, list):
+                    yield from obj
+                else:
+                    raise ValueError(
+                        f"Invalid JSONL at {path}:{line_no}: expected object or list, got {type(obj).__name__}"
+                    )
+        return
+
+    # JSON / gzipped JSON: parse once.
+    with open_text_file() as f:
+        data = json.load(f)
+
+    yield from emit_container(data)
 
 
 def build_candidate_text(candidate: dict[str, Any], as_of_date: date | None = None) -> list[str]:
