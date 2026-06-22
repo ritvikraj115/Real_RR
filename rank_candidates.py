@@ -885,7 +885,11 @@ def positive_family_coverage_bonus(row: np.ndarray, chunks: list[Chunk]) -> tupl
 
 
 def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float, float, int]:
-    """Reward consistently strong evidence rather than many mediocre hits."""
+    """Reward consistently strong evidence rather than many mediocre hits.
+
+    The evidence score is quality-aware and JD-weight-aware, using the strongest
+    three positive chunks with fixed emphasis coefficients [0.5, 0.3, 0.2].
+    """
     hits: list[tuple[float, float]] = []
     positive_total = 0
 
@@ -902,13 +906,17 @@ def evidence_density_bonus(row: np.ndarray, chunks: list[Chunk]) -> tuple[float,
         return 0.0, 0.0, 0
 
     hits.sort(key=lambda item: item[0], reverse=True)
-    top_hits = hits[:5]
-    weighted_num = sum(score * weight for score, weight in top_hits)
-    weighted_den = sum(weight for _, weight in top_hits)
-    quality = weighted_num / max(weighted_den, 1e-6)
-    top3 = top_hits[:3]
-    top3_mean = float(np.mean([score for score, _ in top3])) if top3 else 0.0
-    combined = 0.80 * quality + 0.20 * top3_mean
+    top_hits = hits[:3]
+
+    alpha = (0.5, 0.3, 0.2)
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for coeff, (score, weight) in zip(alpha, top_hits):
+        weighted_num += coeff * weight * score
+        weighted_den += coeff * weight
+
+    combined = weighted_num / max(weighted_den, 1e-6)
+    combined = clamp01(combined)
 
     bonus = EVIDENCE_DENSITY_BONUS_MAX * float(sigmoid((combined - 0.45) * 6.5))
     return float(bonus), float(combined), positive_total
@@ -2773,9 +2781,33 @@ def run(args: argparse.Namespace) -> int:
 
         negative_conf, negative_breakdown = negative_confidence_details(candidates[cand_idx].candidate_text)
 
-        # Smooth family/evidence confidence for CE only. Use quality signals,
-        # not raw family counts, to avoid score cliffs.
-        smart_multiplier = 0.90 + 0.10 * float(sigmoid((0.68 * coverage_quality + 0.32 * evidence_quality - 0.50) * 5.0))
+        # Smart multiplier is based on the spread between CE, Bi-Encoder, and BM25.
+        # Lower disagreement means higher confidence in the Cross-Encoder signal.
+        bm25_row = np.asarray(bm25_scores[cand_idx], dtype=np.float32).ravel()
+        bi_row = np.asarray(vector_scores[cand_idx], dtype=np.float32).ravel()
+
+        def _top3_mean(values: np.ndarray) -> float:
+            vec = np.asarray(values, dtype=np.float32).ravel()
+            if vec.size == 0:
+                return 0.0
+            k = min(3, int(vec.size))
+            if k == vec.size:
+                top = np.sort(vec)[-k:]
+            else:
+                top = np.partition(vec, -k)[-k:]
+            return float(np.mean(top))
+
+        bm25_proxy = clamp01(_top3_mean(bm25_row))
+        bi_proxy = clamp01(_top3_mean(bi_row))
+        ce_proxy = clamp01(float(ce_tech))
+
+        agreement = 1.0 - (
+            abs(ce_proxy - bi_proxy)
+            + abs(ce_proxy - bm25_proxy)
+            + abs(bi_proxy - bm25_proxy)
+        ) / 3.0
+        agreement = clamp01(agreement)
+        smart_multiplier = 0.90 + 0.10 * agreement
 
         # Apply the smart multiplier only to the Cross-Encoder contribution.
         ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
