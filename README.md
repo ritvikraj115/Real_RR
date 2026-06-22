@@ -4,7 +4,7 @@ This repository contains our submission for the **Redrob Intelligent Candidate D
 
 The project implements a **production-inspired, multi-stage hybrid candidate ranking pipeline** that progressively narrows the candidate search space while increasing the sophistication of evaluation at each stage. It combines structured recruiter signals, hybrid information retrieval, semantic reranking, and explainable score fusion to rank candidates for a given job description under the hackathon's CPU-only runtime constraints.
 
-Rather than relying on a single ranking signal, the system combines **structured eligibility**, **lexical retrieval**, **semantic retrieval**, **pairwise neural verification**, and **behavior-aware scoring** into one interpretable ranking framework.
+Rather than relying on a single ranking signal, the system combines **structured eligibility**, **lexical retrieval**, **semantic retrieval**, **pairwise neural verification**, and **behavior-aware scoring** into one interpretable ranking framework. The latest version also adds agreement-aware Cross-Encoder calibration, JD-weighted evidence scoring, and a small adaptive semantic fusion layer that stays close to the original [0.55, 0.25, 0.20] blend.
 
 ---
 
@@ -254,6 +254,8 @@ where:
 
 Only a single sigmoid transformation is applied.
 
+The Cross-Encoder score is then softly adjusted using an agreement-based Smart Multiplier. The multiplier stays close to 1.0 and nudges the Cross-Encoder contribution only when BM25, the Bi-Encoder, and the Cross-Encoder are in stronger agreement. A small negative-evidence risk penalty is also applied to the Cross-Encoder contribution before semantic fusion, so isolated risky chunks do not dominate the final score.
+
 The strongest semantic evidence is then aggregated using a consistency-aware formulation:
 
 $$
@@ -263,6 +265,7 @@ $$
 which rewards candidates demonstrating consistently strong evidence rather than relying on a single exceptional passage.
 
 ---
+
 
 ## Stage 7 — Coverage Quality
 
@@ -281,22 +284,22 @@ where:
 
 This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
 
+Coverage is kept as a small bounded bonus, so it refines the semantic ranking instead of replacing it.
+
 ---
+
 
 ## Stage 8 — Evidence Density
 
 Evidence Density measures the consistency of supporting semantic evidence throughout the candidate profile.
 
-Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes. The implementation now also uses JD weights so high-importance evidence matters more than low-importance evidence.
+Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes. The implementation also uses JD weights so high-importance evidence matters more than low-importance evidence.
 
-A compact view of the score is:
+The evidence score is computed from the strongest three positive chunks using fixed emphasis coefficients \(\alpha=[0.5,0.3,0.2]\):
 
 $$
 Evidence=
 \frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
-\qquad
-\text{with }
-\alpha=[0.5,0.3,0.2]
 $$
 
 where:
@@ -304,9 +307,14 @@ where:
 * \(S_i\) is the Cross-Encoder score for the selected evidence,
 * \(w_i\) is the corresponding JD chunk weight.
 
+The three evidence chunks are selected with a light JD-weight-aware preference before aggregation, so more important chunks can edge out weaker ones when the scores are close.
+
 This keeps the score focused on the strongest evidence while still respecting JD importance and consistency.
 
+Evidence is also kept as a small bounded bonus so it improves ranking stability without overpowering semantic relevance.
+
 ---
+
 
 ## Stage 9 — Negative Confidence
 
@@ -316,11 +324,18 @@ Rather than applying hard penalties, multiple negative signals are aggregated in
 
 ---
 
+
 ## Stage 10 — Final Score Fusion
 
-Semantic relevance is computed using an adaptive reliability-weighted fusion of the three retrieval signals. The weights shift slightly based on agreement while still summing to 1.0.
+Semantic relevance is computed using an adaptive reliability-weighted fusion of the three retrieval signals. The weights shift only slightly around the original base blend while still staying normalized.
 
-In practice, the model still starts from the same semantic sources, but the contribution of each source is nudged by how consistent it is with the others.
+The base blend starts from:
+
+$$
+[0.55,\;0.25,\;0.20]
+$$
+
+and is nudged by a small reliability-centered adjustment derived from agreement between the Cross-Encoder, Bi-Encoder, and BM25 proxies. In practice, this keeps the ensemble close to the original design while giving slightly more trust to the signals that agree better on a given candidate.
 
 The final ranking score combines:
 
@@ -344,8 +359,10 @@ The ranking system was designed around several production-inspired principles:
 * **Hybrid retrieval** — lexical and semantic retrieval complement each other rather than competing.
 * **Family-aware diversification** — retrieval is balanced across multiple conceptual JD families.
 * **Adaptive evidence selection** — only the strongest semantic evidence is passed to the Cross-Encoder.
+* **Agreement-aware CE calibration** — the Cross-Encoder is softly calibrated using agreement with BM25 and the Bi-Encoder, rather than being allowed to dominate blindly.
 * **Consistency-aware reranking** — candidates with multiple strong supporting signals are preferred over isolated matches.
 * **Quality-weighted coverage** — breadth is measured using semantic quality rather than simple family counts.
+* **Weighted evidence density** — the strongest evidence is scored with JD importance awareness instead of raw hit count.
 * **Behavior-aware ranking** — structured recruiter signals refine semantic relevance without dominating it.
 * **Explainable scoring** — every major score corresponds to an interpretable hiring dimension.
 
