@@ -495,7 +495,6 @@ This keeps semantic relevance dominant while behavior, coverage, evidence, and n
 ---
 
 # Outputs and Diagnostics
-# Outputs and Diagnostics
 
 The main submission file is:
 
