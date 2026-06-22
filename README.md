@@ -13,7 +13,6 @@ Rather than relying on a single ranking signal, the system combines **structured
 ```text
 .
 ├── models/                         # Cached SentenceTransformer and Cross-Encoder models
-├── cache/                          # Cached JD embeddings and intermediate artifacts
 ├── app.py                          # Optional Streamlit demonstration
 ├── jd_hybrid_index.json            # Preprocessed hybrid JD index
 ├── rank_candidates.py              # Main ranking pipeline
@@ -27,10 +26,7 @@ Generated when you run the pipeline:
 
 ```text
 Real_RR.csv                         # Final submission file
-diagnostic_top20.csv                # Optional manual inspection output
 ```
-
-Optional diagnostic exports may also be written when the corresponding CLI flags are enabled.
 
 ---
 
@@ -57,7 +53,7 @@ We recommend using a clean virtual environment.
 
 ```bash
 # Clone the repo
-git clone <repo-url>
+git clone 
 cd Real_RR
 
 # Create virtual environment (Python 3.12)
@@ -99,15 +95,17 @@ If you want to inspect intermediate outputs, enable the optional report flags in
 
 ---
 
+
+
 # Pipeline Overview
 
-The ranking pipeline progressively reduces the candidate search space while applying increasingly sophisticated evaluation methods. Earlier stages efficiently remove obvious mismatches, whereas later stages perform computationally expensive semantic verification only on the strongest candidates.
+The ranking pipeline reduces the candidate pool stage by stage.
 
 ```text
 L0 Structured Triage
         │
         ▼
-Behavior Validation Score (BVS)
+Behavior Validation Score
         │
         ▼
 Candidate Enrichment
@@ -115,19 +113,19 @@ Candidate Enrichment
         ▼
 Hybrid Retrieval
  ├── BM25 Lexical Retrieval
- └── Dense Vector Retrieval (Bi-Encoder)
+ └── Dense Vector Retrieval
         │
         ▼
-Family-aware Candidate Recall
+Family aware Candidate Recall
         │
         ▼
-Adaptive Cross-Encoder Chunk Selection
+Adaptive Cross Encoder Chunk Selection
         │
         ▼
-Cross-Encoder Pairwise Reranking
+Cross Encoder Pairwise Reranking
         │
         ▼
-Quality-based Coverage
+Quality based Coverage
         │
         ▼
 Evidence Density
@@ -148,100 +146,121 @@ Ranked Candidate List
 
 ## Stage 1 — L0 Structured Triage
 
-The pipeline begins with a conservative structured filtering stage based entirely on explicit candidate metadata.
+This stage uses only explicit candidate metadata.
 
-Only candidates with clear eligibility mismatches are removed using structured recruiter signals such as:
+It removes only clear eligibility mismatches such as:
 
 * notice period
 * recruiter activity
 * relocation preference
 * location compatibility
 * profile completeness
-* structured hiring attributes
+* other structured hiring signals
 
-No semantic matching is performed at this stage. That keeps the filter fast and conservative, so the system reduces the search space while minimizing false negatives.
+No semantic matching is used here.
+
+The goal is to shrink the search space while keeping false negatives low.
 
 ---
 
-## Stage 2 — Behavior Validation Score (BVS)
+## Stage 2 — Behavior Validation Score
 
-Each remaining candidate receives a **Behavior Validation Score (BVS)** that measures recruiter-oriented profile quality independently of semantic relevance.
+Each surviving candidate receives a Behavior Validation Score.
 
-The raw structured score is first shaped with a smooth non-saturating curve:
+The raw structured score is shaped as:
 
 $$
-r = 0.02 + 0.96\,\sigma\!\left(4.20(x-0.50)\right)
+\operatorname{shape\_bvs\_score}(x)
+=
+\operatorname{clip}_{0}^{1}
+\left(
+0.02
++
+0.96\,\sigma\!\left((x-0.50)\times 4.20\right)
+\right)
 $$
 
 where $\sigma$ is the sigmoid function.
 
-The shaped score is then blended with a percentile-stretched version to keep the upper tail separable:
+The code then blends the shaped score with a percentile stretched version:
 
 $$
-\mathrm{BVS}=(1-\lambda)r+\lambda\left(1-\bigl(1-\pi(r)\bigr)^{0.45}\right)
+r_i
+=
+\operatorname{percentile\_rank}(s)_i
+=
+1
+-
+\frac{p_i}{n-1}
 $$
 
-where $\pi(r)$ is the percentile rank of $r$ and $\lambda=0.34$.
+$$
+t_i
+=
+\operatorname{stretch\_bvs\_percentile}(r_i)
+=
+1
+-
+(1-r_i)^{0.45}
+$$
 
-This keeps the score spread meaningful while reducing top-end compression.
+$$
+\mathrm{BVS}
+=
+(1-0.34)\,s
++
+0.34\,t
+$$
 
-The score combines structured hiring signals including:
+The candidate is discarded if the shaped score falls below the L0 threshold:
 
-* recruiter responsiveness
-* assessment performance
-* interview completion
-* notice period
-* experience alignment
-* profile quality
-* verification status
-* market engagement
-* recruiter activity
+$$
+\mathrm{BVS} < 0.27
+$$
 
 ---
 
 ## Stage 3 — Candidate Enrichment
 
-Before retrieval, candidate narratives are enriched using lightweight taxonomy expansion.
+Candidate text is enriched for retrieval only.
 
-Relevant technologies, production terminology, deployment concepts, retrieval keywords, ranking terminology, and domain-specific concepts are appended as hidden retrieval tags.
+The code appends hidden retrieval tags from lightweight positive and negative taxonomy rules.
 
-This improves retrieval recall without modifying the original candidate information or requiring additional embedding models.
+These tags improve retrieval recall.
+
+They are not shown in the final explanation.
 
 ---
 
 ## Stage 4 — Hybrid Retrieval
 
-The pipeline combines sparse lexical retrieval and dense semantic retrieval.
+The pipeline combines lexical retrieval and dense semantic retrieval.
 
-### BM25 Retrieval
+### BM25 Lexical Retrieval
 
-BM25 retrieves candidates through exact lexical matching between the job description and candidate profiles.
+BM25 captures exact lexical overlap between the job description and the candidate narrative.
 
-This stage captures:
+### Dense Vector Retrieval
 
-* exact technologies
-* recruiter terminology
-* product keywords
-* implementation-specific skills
-* domain vocabulary
+Candidate narratives and JD chunks are encoded with a Sentence Transformer Bi Encoder.
 
-### Dense Vector Retrieval (Bi-Encoder)
-
-Candidate narratives and JD chunks are encoded using a Sentence Transformer Bi-Encoder.
-
-Semantic similarity is computed using cosine similarity:
+Semantic similarity uses cosine similarity:
 
 $$
-\mathrm{CosSim}(x,y)=\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
+\operatorname{CosSim}(x,y)
+=
+\frac{x\cdot y}{\lVert x\rVert\,\lVert y\rVert}
 $$
 
-This allows semantically similar concepts to match even when different terminology is used.
+The retrieval stage keeps both lexical and semantic signals.
 
 ---
 
-## Stage 5 — Family-aware Candidate Recall
+## Stage 5 — Family aware Candidate Recall
 
-Rather than selecting only globally highest-scoring retrieval results, candidate recall is diversified across multiple conceptual JD families:
+Retrieval is diversified across JD families instead of taking only the global top scores.
+
+The positive families are:
 
 * Retrieval
 * Evaluation
@@ -251,184 +270,292 @@ Rather than selecting only globally highest-scoring retrieval results, candidate
 * Culture
 * Advanced Skills
 
-This prevents a single topic from dominating retrieval while encouraging broad semantic coverage across the complete job description.
+This prevents one topic from dominating the pool.
 
 ---
 
-## Stage 6 — Adaptive Cross-Encoder Reranking
+## Stage 6 — Adaptive Cross Encoder Reranking
 
-The strongest candidate evidence is first selected through adaptive chunk selection.
+The Cross Encoder sees only selected candidate evidence chunks.
 
-Instead of evaluating every available candidate passage, the pipeline retains only:
+The selection limits are:
 
-* up to **6 high-quality positive evidence chunks**
-* up to **2 informative negative evidence chunks**
+* up to 6 positive chunks
+* up to 2 negative chunks
 
-This substantially reduces Cross-Encoder computation while preserving semantic recall.
+Chunk selection is guided by earlier retrieval strength and by a light JD weight preference.
 
-When the Cross-Encoder returns logits, they are centered and converted to probabilities:
-
-$$
-p=\sigma\!\left(\frac{z-\beta}{T}\right)
-$$
-
-where:
-
-* $z$ is the raw Cross-Encoder logit,
-* $\beta$ is the median finite shortlist logit when logits are available,
-* $T$ is the calibration temperature.
-
-The temperature is chosen from the shortlist spread when enough finite logits exist, and the result is clipped to $[10^{-4},\,1-10^{-4}]$ for numerical stability.
-
-The Cross-Encoder contribution is then softly adjusted using an agreement-based Smart Multiplier:
+The code applies a smart multiplier using agreement between the three retrieval signals:
 
 $$
-a=\max\left(0,\min\left(1,1-\frac{|c-v|+|c-l|+|v-l|}{3}\right)\right)
+agreement
+=
+1
+-
+\frac{
+\lvert ce\_proxy-bi\_proxy\rvert
++
+\lvert ce\_proxy-bm25\_proxy\rvert
++
+\lvert bi\_proxy-bm25\_proxy\rvert
+}{3}
 $$
 
 $$
-m=0.90+0.10a
+smart\_multiplier
+=
+0.90
++
+0.10 \times agreement
+$$
+
+The calibrated Cross Encoder contribution is:
+
+$$
+ce\_adjusted
+=
+ce\_tech
+\times
+smart\_multiplier
+\times
+e^{-2.4\,\max(0,cross\_neg)}
+$$
+
+The semantic fusion signal is then built from:
+
+$$
+semantic\_proxy
+=
+\operatorname{clamp01}(semantic\_boost)^{0.92}
 $$
 
 $$
-c_{\mathrm{adj}}=c\,m\,e^{-2.4\max(0,n)}
-$$
-
-where $c$ is the Cross-Encoder score, $v$ is the Bi-Encoder score, $l$ is the BM25 score, and $n$ is the negative evidence confidence.
-
-The semantic fusion stage then applies a small consensus-aware calibration around the base retrieval blend:
-
-$$
-\mathbf{w}_0=[0.55,\,0.25,\,0.20]
+fusion\_base
+=
+[0.55,\;0.25,\;0.20]
 $$
 
 $$
-\hat{\mathbf{r}}=\frac{[r_c,\,r_v,\,r_l]}{\lVert[r_c,\,r_v,\,r_l]\rVert_1}
+reliability_i
+=
+e^{-4\lvert s_i-\bar{s}\rvert}
+$$
+
+where
+
+$$
+s
+=
+\begin{bmatrix}
+ce\_proxy\\
+semantic\_proxy\\
+bm25\_proxy
+\end{bmatrix}
+$$
+
+and
+
+$$
+\bar{s}
+=
+\frac{ce\_proxy + semantic\_proxy + bm25\_proxy}{3}
+$$
+
+The final fusion weights are:
+
+$$
+fusion\_weights
+=
+\operatorname{normalize}
+\left(
+0.92 \cdot fusion\_base
++
+0.08 \cdot reliability
+\right)
+$$
+
+The semantic core is:
+
+$$
+semantic\_core
+=
+fusion\_weights \cdot [ce\_adjusted,\;semantic\_proxy,\;bm25\_proxy]
+$$
+
+The strongest semantic scores are then stretched only in the upper tail:
+
+$$
+semantic\_core
+=
+\operatorname{stretch\_upper\_tail}(semantic\_core)
+$$
+
+with
+
+$$
+threshold = 0.75
 $$
 
 $$
-\hat{\mathbf{w}}=\frac{0.92\,\mathbf{w}_0+0.08\,\hat{\mathbf{r}}}{\lVert0.92\,\mathbf{w}_0+0.08\,\hat{\mathbf{r}}\rVert_1}
-$$
-
-$$
-S=\hat{w}_1 c_{\mathrm{adj}}+\hat{w}_2 v+\hat{w}_3 l
-$$
-
-The resulting semantic score is then stretched only in the upper tail so the strongest matches separate a little more without changing the ordering of the rest of the scale:
-
-$$
-S'=
-\begin{cases}
-S, & S\le 0.75 \\
-0.75+0.25\left(\dfrac{S-0.75}{0.25}\right)^{0.92}, & S>0.75
-\end{cases}
+gamma = 0.92
 $$
 
 ---
 
-## Stage 7 — Coverage Quality
+## Stage 7 — Quality based Coverage
 
-Coverage measures how completely a candidate satisfies the conceptual areas represented within the job description.
+Coverage measures how much of the JD is covered.
 
-Rather than counting matched families, the pipeline evaluates the strongest semantic evidence within each family and computes a weighted quality score:
-
-$$
-q=\frac{\sum_i w_i\,Best_i}{\sum_i w_i}
-$$
-
-where:
-
-* $Best_i$ is the strongest semantic similarity observed for family $i$,
-* $w_i$ is the corresponding JD importance weight.
-
-That quality signal is blended with family breadth and then turned into a bounded bonus:
+For each family, the code takes the strongest semantic score in that family and weights it by JD importance.
 
 $$
-b=\frac{|F|}{7}
+quality
+=
+\frac{\sum_i w_i\,Best_i}{\sum_i w_i}
 $$
 
 $$
-C=0.06\times\sigma\!\left(6.0\,(0.80q+0.20b-0.45)\right)
+breadth
+=
+\frac{\lvert families\_hit\rvert}{7}
 $$
 
-where $F$ is the set of families hit.
-
-This rewards both semantic quality and conceptual breadth while avoiding duplicated evidence.
+$$
+Coverage
+=
+0.06
+\times
+\sigma\!\left(
+\left(
+0.80\,quality
++
+0.20\,breadth
+-
+0.45
+\right)
+\times
+6.0
+\right)
+$$
 
 ---
 
 ## Stage 8 — Evidence Density
 
-Evidence Density measures the consistency of supporting semantic evidence throughout the candidate profile.
+Evidence Density measures how consistently the candidate is supported by strong evidence.
 
-Instead of rewarding numerous weak matches, only the strongest semantic evidence contributes. The implementation also uses JD weights so high-importance evidence matters more than low-importance evidence.
+The code keeps the strongest three positive chunks.
 
-The score is computed from the strongest three positive chunks using fixed emphasis coefficients $\alpha=[0.5,0.3,0.2]$:
-
-$$
-z=\frac{\sum_{i=1}^{3}\alpha_i w_i S_i}{\sum_{i=1}^{3}\alpha_i w_i}
-$$
+The selection order uses:
 
 $$
-D=0.06\times\sigma\!\left(6.5\,(z-0.45)\right)
+S_i\sqrt{w_i}
 $$
 
-where:
+The aggregation is:
 
-* $S_i$ is the Cross-Encoder score for the selected evidence,
-* $w_i$ is the corresponding JD chunk weight.
+$$
+E
+=
+\frac{\sum_{i=1}^{3}\alpha_i\,w_i\,S_i}{\sum_{i=1}^{3}\alpha_i\,w_i}
+$$
 
-The three evidence chunks are selected with a light JD-weight-aware preference before aggregation, so more important chunks can edge out weaker ones when the scores are close.
+where
 
-This keeps the score focused on the strongest evidence while still respecting JD importance and consistency.
+$$
+\alpha
+=
+[0.5,\;0.3,\;0.2]
+$$
+
+and
+
+$$
+Evidence
+=
+0.06
+\times
+\sigma\!\left(
+\left(
+E
+-
+0.45
+\right)
+\times
+6.5
+\right)
+$$
 
 ---
 
 ## Stage 9 — Negative Confidence
 
-Potential recruiter risks—including wrapper-only experience, research-only backgrounds, or weak production evidence—are summarized into a calibrated Negative Confidence score.
+Negative Confidence summarizes recruiter risk from the candidate narrative.
 
-The negative families are aggregated into a single confidence value:
-
-$$
-n=\frac{g}{g+h+0.20}
-$$
-
-where $g$ is negative strength and $h$ is positive strength.
-
-The downstream penalty is then applied as:
+The negative signal is aggregated as:
 
 $$
-P_{\mathrm{neg}}=
+negative\_confidence
+=
+\frac{negative\_strength}{negative\_strength + positive\_strength + 0.20}
+$$
+
+The penalty is:
+
+$$
+negative\_confidence\_penalty(n)
+=
 \begin{cases}
-1.0, & n\le 0.18 \\
-e^{-2.4\,(n-0.18)}, & n>0.18
+1.0 & n \le 0.18 \\
+e^{-2.40\,(n-0.18)} & n > 0.18
 \end{cases}
 $$
 
-Rather than applying hard penalties, multiple negative signals are aggregated into a confidence estimate. That keeps the system explainable and reduces false penalties from isolated keywords.
+This keeps negative evidence bounded and explainable.
 
 ---
 
 ## Stage 10 — Final Score Fusion
 
-The final score combines semantic relevance, behavior signals, coverage, evidence, and a calibrated negative penalty.
+The final score uses semantic relevance as the main signal.
 
-The final ranking formula in the current code is:
-
-$$
-F_{\mathrm{raw}}=0.72\,S' + 0.17\,(BVS-0.5) + C + D
-$$
+The BVS contribution is centered:
 
 $$
-F_{\mathrm{score}}=F_{\mathrm{raw}}\times P_{\mathrm{neg}}
+bvs\_bonus
+=
+0.17\,(BVS-0.5)
 $$
 
-This keeps semantic relevance dominant, while behavior, coverage, evidence, and negative confidence act as bounded refinements instead of replacing the core retrieval signal.
+The raw final score is:
+
+$$
+final\_raw
+=
+0.72\,semantic\_core
++
+bvs\_bonus
++
+Coverage
++
+Evidence
+$$
+
+The final score is:
+
+$$
+final\_score
+=
+final\_raw
+\times
+negative\_confidence\_penalty(negative\_confidence)
+$$
+
+This keeps semantic relevance dominant while using coverage evidence BVS and negative confidence as bounded refinements.
 
 ---
 
-# Outputs and Diagnostics
+## Outputs and Diagnostics
 
 The main submission file is:
 
@@ -436,25 +563,34 @@ The main submission file is:
 
 The pipeline can also write:
 
-* `diagnostic_top20.csv` for manual inspection
-* optional stage-specific report CSVs when enabled via CLI flags
-* cached model/embedding artifacts under `models/` and `cache/`
+* `diagnostic_top20.csv`
+* optional stage specific report CSVs
+* cached model and embedding artifacts under `models/` and `cache/`
 
-The explanation text in the final output is generated from candidate narrative text, structured BVS signals, and the selected evidence passages. Internal retrieval tags are used only for retrieval and do not need to appear in the final explanation.
+The main CSV contains these fields:
+
+* `candidate_id`
+* `semantic_score`
+* `negative_score`
+* `semantic_final_raw`
+* `semantic_final_norm`
+* `bvs_score`
+* `final_score`
 
 ---
 
-# Caching
+## Caching
 
-To improve reproducibility and runtime, the pipeline caches intermediate computations including:
+To improve reproducibility and runtime the pipeline caches:
 
 * Sentence Transformer models
-* Cross-Encoder models
+* Cross Encoder models
 * JD embeddings
 
-The first execution downloads models and creates caches. Subsequent executions reuse these cached artifacts to significantly reduce runtime while preserving deterministic behaviour.
+The first execution downloads models and creates caches.
 
----
+Later runs reuse the cached artifacts.
+
 
 # Notes
 
