@@ -16,6 +16,7 @@ import math
 import os
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -26,6 +27,11 @@ import numpy as np
 import glob
 import gzip
 import os
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+.#/-]*")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -258,6 +264,14 @@ def recombine_offline_models(base_dir="models"):
 
 # Trigger this immediately before your script loads the SentenceTransformers
 recombine_offline_models("models")
+
+
+def candidate_json_loads(payload: str | bytes) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(payload)
+    return json.loads(payload)
+
+
 def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall((text or "").lower())
 
@@ -1390,7 +1404,7 @@ def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
                 if not line:
                     continue
                 try:
-                    parsed_line = json.loads(line)
+                    parsed_line = candidate_json_loads(line)
                 except json.JSONDecodeError as exc:
                     if not yielded_any:
                         fallback_to_full_json = True
@@ -1416,7 +1430,7 @@ def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
     # First try a single JSON object / array. This handles pretty-printed JSON
     # that may have been saved with a .jsonl extension by the sandbox UI.
     try:
-        parsed = json.loads(raw_text)
+        parsed = candidate_json_loads(raw_text)
     except json.JSONDecodeError:
         parsed = None
     if parsed is not None:
@@ -1798,12 +1812,20 @@ def apply_l0_triage(
         text_l = (text or "").lower()
         return any(term in text_l for term in terms)
 
-    for candidate in candidates:
+    started_at = time.perf_counter()
+    for row_no, candidate in enumerate(candidates, 1):
         cand_id = str(candidate.get("candidate_id") or "").strip()
         profile = candidate.get("profile") or {}
         signals = candidate.get("redrob_signals") or {}
         history = candidate.get("career_history") or []
         skills = candidate.get("skills") or []
+        if row_no % 10000 == 0:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[ranker] L0 triage processed {row_no}/{len(candidates)} candidates "
+                f"in {elapsed:.1f}s; staged={len(staged)} discarded={len(discarded)}",
+                file=sys.stderr,
+            )
 
         current_title = str(profile.get("current_title") or "").lower()
         current_industry = str(profile.get("current_industry") or "").lower()
@@ -2177,6 +2199,7 @@ def load_candidates(
     max_candidates: int | None,
 ) -> tuple[list[CandidateRecord], np.ndarray, list[dict[str, str]], float]:
     raw_candidates: list[dict[str, Any]] = []
+    started_at = time.perf_counter()
     for idx, candidate in enumerate(iter_candidate_objects(path), 1):
         if max_candidates is not None and len(raw_candidates) >= max_candidates:
             break
@@ -2184,10 +2207,15 @@ def load_candidates(
         if not candidate_id:
             raise ValueError(f"Candidate at input row {idx} has no candidate_id")
         raw_candidates.append(candidate)
+        if idx % 10000 == 0:
+            elapsed = time.perf_counter() - started_at
+            print(f"[ranker] parsed {idx} candidate rows in {elapsed:.1f}s", file=sys.stderr)
 
     if not raw_candidates:
         raise ValueError(f"No candidates loaded from {path}")
 
+    elapsed = time.perf_counter() - started_at
+    print(f"[ranker] parsed {len(raw_candidates)} candidate rows in {elapsed:.1f}s; applying L0 triage", file=sys.stderr)
     return apply_l0_triage(raw_candidates, as_of)
 
 
