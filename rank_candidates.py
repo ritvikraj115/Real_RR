@@ -2730,9 +2730,11 @@ def compute_cross_encoder_scores(
                 order = np.argsort(-row, kind="mergesort")
                 top = order[:3]
                 top_scores = row[top]
-                max_score = float(top_scores[0]) if top_scores.size else 0.0
-                mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
-                pos_scores[row_idx] = float(np.clip(clamp01(0.70 * max_score + 0.30 * mean_top), CE_SCORE_EPS, 1.0 - CE_SCORE_EPS))
+                strongest = float(top_scores[0]) if top_scores.size else 0.0
+                supporting = top_scores[1:3]
+                support_consensus = float(np.mean(supporting)) if supporting.size else 0.0
+                # Verified CE evidence: strongest chunk once, then only supporting chunks.
+                pos_scores[row_idx] = float(np.clip(clamp01(0.60 * strongest + 0.40 * support_consensus), CE_SCORE_EPS, 1.0 - CE_SCORE_EPS))
         if neg_cols:
             row = np.asarray(cross_adjusted[row_idx, neg_cols], dtype=np.float32)
             if row.size:
@@ -2741,6 +2743,7 @@ def compute_cross_encoder_scores(
                 top_scores = row[top]
                 max_score = float(top_scores[0]) if top_scores.size else 0.0
                 mean_top = float(np.mean(top_scores)) if top_scores.size else 0.0
+                # Negative CE risk intentionally keeps max+mean over the top two risk chunks.
                 neg_scores[row_idx] = float(np.clip(clamp01(0.70 * max_score + 0.30 * mean_top), CE_SCORE_EPS, 1.0 - CE_SCORE_EPS))
 
     return pos_scores, neg_scores, cross_adjusted, f"sentence_transformers_cross_encoder:{model_path}"
@@ -2781,41 +2784,57 @@ def make_reasoning(
     background_positive_scores: np.ndarray | None = None,
     background_negative_scores: np.ndarray | None = None,
 ) -> str:
-    pos = [
+    positive = [
         (float(adjusted_scores[idx]), idx)
         for idx, chunk in enumerate(chunks)
-        if chunk.polarity == "positive" and adjusted_scores[idx] > 0.05
+        if chunk.polarity == "positive" and float(adjusted_scores[idx]) > 0.05
     ]
-    neg = [
+    negative = [
         (float(adjusted_scores[idx]), idx)
         for idx, chunk in enumerate(chunks)
-        if chunk.polarity == "negative" and adjusted_scores[idx] > 0.05
+        if chunk.polarity == "negative" and float(adjusted_scores[idx]) > 0.10
     ]
-    background_pos = [
+    background_positive = [
         (float(background_positive_scores[idx]), idx)
         for idx, chunk in enumerate(chunks)
-        if background_positive_scores is not None and chunk.polarity == "positive" and background_positive_scores[idx] > 0.05
+        if background_positive_scores is not None
+        and chunk.polarity == "positive"
+        and float(background_positive_scores[idx]) > 0.05
     ]
-    background_neg = [
+    background_negative = [
         (float(background_negative_scores[idx]), idx)
         for idx, chunk in enumerate(chunks)
-        if background_negative_scores is not None and chunk.polarity == "negative" and background_negative_scores[idx] > 0.05
+        if background_negative_scores is not None
+        and chunk.polarity == "negative"
+        and float(background_negative_scores[idx]) > 0.12
     ]
+
+    family_order = {
+        "PRODUCT": 0,
+        "RETRIEVAL": 1,
+        "EVALUATION": 2,
+        "SYSTEMS": 3,
+        "DOMAIN": 4,
+        "CULTURE": 5,
+        "ADVANCED": 6,
+        "NEGATIVE": 7,
+    }
 
     def sort_evidence(items: list[tuple[float, int]]) -> list[tuple[float, int]]:
         return sorted(
             items,
             key=lambda item: (
+                family_order.get(chunk_family(chunks[item[1]].id), 99),
                 -float(effective_chunk_weight(chunks[item[1]])),
                 -float(item[0]),
                 chunks[item[1]].id,
             ),
         )
 
-    pos = sort_evidence(pos)
-    background_pos = sort_evidence(background_pos)
-    neg = sort_evidence(neg)
-    background_neg = sort_evidence(background_neg)
+    positive = sort_evidence(positive)
+    background_positive = sort_evidence(background_positive)
+    negative = sort_evidence(negative)
+    background_negative = sort_evidence(background_negative)
 
     def to_text(value: Any) -> str:
         if value is None:
@@ -2825,25 +2844,14 @@ def make_reasoning(
         if isinstance(value, (list, tuple, set)):
             return " ".join(to_text(v) for v in value if v is not None)
         if isinstance(value, dict):
-            for key in ("text", "value", "name", "label", "title", "description"):
-                if key in value:
-                    return to_text(value[key])
             return " ".join(to_text(v) for v in value.values())
         return str(value)
 
     def normalize_text(value: Any) -> str:
         return " ".join(to_text(value).split()).strip()
 
-    candidate_text = normalize_text(candidate.candidate_text)
-    raw_sentences = [
-        normalize_text(sentence)
-        for sentence in SENTENCE_RE.split(candidate_text)
-        if normalize_text(sentence)
-    ]
-    achievement_snippets = [normalize_text(s) for s in extract_achievement_snippets(candidate_text)] if candidate_text else []
-
-    def clamp_snippet(text: Any, limit: int = 180) -> str:
-        snippet = normalize_text(text).strip().strip("\"'“”")
+    def clean_snippet(text: Any, limit: int = 190) -> str:
+        snippet = normalize_text(text).strip().strip("\"'")
         snippet = re.sub(
             r"^(current role\. most recent evidence\. production impact\.|"
             r"recent role\. fresh evidence\. production impact\.|"
@@ -2855,368 +2863,53 @@ def make_reasoning(
             flags=re.IGNORECASE,
         ).strip()
         if len(snippet) > limit:
-            cut = snippet[: limit - 3].rsplit(" ", 1)[0]
-            snippet = (cut if cut else snippet[: limit - 3]).rstrip(" .;:") + "..."
+            boundary_cut = ""
+            for match in re.finditer(r"(?<=[.!?;:])\s+", snippet):
+                if 60 <= match.end() <= limit:
+                    boundary_cut = snippet[: match.end()].strip()
+            if boundary_cut:
+                snippet = boundary_cut.rstrip(" .;:!?")
+            else:
+                clause_positions = [
+                    pos
+                    for marker in (", ", " - ", " -- ")
+                    for pos in [snippet.rfind(marker, 0, limit)]
+                    if pos >= 60
+                ]
+                if clause_positions:
+                    snippet = snippet[: max(clause_positions)].strip().rstrip(" .;:,")
+                else:
+                    cut = snippet[: limit - 3].rsplit(" ", 1)[0]
+                    snippet = (cut if cut else snippet[: limit - 3]).rstrip(" .;:")
+                snippet += "..."
         return snippet.rstrip(" .;:")
 
-    def has_any(text: Any, terms: tuple[str, ...]) -> bool:
-        text_l = normalize_text(text).lower()
-        return any(term in text_l for term in terms)
-
-    def count_terms(text_l: str, terms: tuple[str, ...]) -> int:
-        return sum(1 for term in terms if term and term in text_l)
-
-    def sentence_overlap_ratio(a: str, b: str) -> float:
-        ta = set(tokenize(a))
-        tb = set(tokenize(b))
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / float(min(len(ta), len(tb)))
-
-    def chunk_family_bucket(family: str) -> str:
-        return {
-            "RETRIEVAL": "retrieval",
-            "EVALUATION": "evaluation",
-            "SYSTEMS": "systems",
-            "PRODUCT": "production",
-            "DOMAIN": "recruiter_domain",
-            "CULTURE": "communication",
-            "ADVANCED": "advanced",
-        }.get(family, "direct_fit")
-
-    def family_phrase(families: list[str]) -> str:
-        labels = {
-            "RETRIEVAL": "retrieval and ranking",
-            "EVALUATION": "evaluation",
-            "SYSTEMS": "systems engineering",
-            "PRODUCT": "production delivery",
-            "DOMAIN": "recruiter workflow",
-            "CULTURE": "async collaboration",
-            "ADVANCED": "advanced AI work",
-            "NEGATIVE": "risk signals",
-        }
-        names = [labels.get(family, family.lower()) for family in families if family]
-        names = list(dict.fromkeys(names))
-        if not names:
-            return ""
-        if len(names) == 1:
-            return names[0]
-        return ", ".join(names[:-1]) + f", and {names[-1]}"
-
-    def top_families(items: list[tuple[float, int]], limit: int = 3) -> list[str]:
-        out: list[str] = []
-        for _, idx in items:
-            family = chunk_family(chunks[idx].id)
-            if family not in out:
-                out.append(family)
-            if len(out) >= limit:
-                break
-        return out
-
-    def risk_phrase(items: list[tuple[float, int]], limit: int = 1) -> str:
-        labels = {
-            "C19": "research-heavy experience without production proof",
-            "C20": "wrapper-style AI work without retrieval depth",
-            "C21": "hands-off architecture risk",
-            "C22": "CV, speech, or robotics domain mismatch",
-            "C23": "limited external validation",
-            "C24": "demo or framework-only systems depth",
-        }
-        phrases = [labels.get(chunks[idx].id, chunk_label(chunks[idx]).lower()) for _, idx in items[:limit]]
-        phrases = list(dict.fromkeys(phrases))
-        if not phrases:
-            return ""
-        if len(phrases) == 1:
-            return phrases[0]
-        return " and ".join(phrases)
-
-    def sentence_topic(text: Any) -> str:
-        s = normalize_text(text).lower()
-        if has_any(s, ("built", "developed", "shipped", "launched", "deployed", "served", "users", "customers", "live", "scale", "latency", "throughput")):
-            return "production"
-        if has_any(s, ("retrieval", "ranking", "search", "recommendation", "rerank", "reranking", "embedding", "embeddings", "vector", "hybrid search", "dense retrieval")):
-            return "retrieval"
-        if has_any(s, ("evaluation", "ndcg", "mrr", "map", "offline", "online", "a/b", "ab test", "interleaving", "relevance benchmark")):
-            return "evaluation"
-        if has_any(s, ("system", "architecture", "pipeline", "observability", "monitoring", "rollback", "incident", "latency", "throughput")):
-            return "systems"
-        if has_any(s, ("ownership", "owned", "owning", "led", "architected", "built from scratch", "end to end", "cross functional", "mentored", "stakeholder")):
-            return "ownership"
-        if has_any(s, ("hr", "recruiting", "talent", "ats", "hiring", "candidate", "recruiter")):
-            return "recruiter_domain"
-        if has_any(s, ("async", "asynchronous", "disagree", "disagreement", "documentation", "docs", "decision making", "communication", "writing")):
-            return "communication"
-        if has_any(s, ("graphrag", "graph rag", "knowledge graph", "neo4j", "entity resolution", "graph search")):
-            return "advanced"
-        if has_any(s, ("open to work", "recent activity", "response", "notice period", "signup", "location", "pune", "noida", "delhi", "gurgaon", "gurugram", "mumbai", "hyderabad", "ncr", "relocate")):
-            return "balanced"
-        return "direct_fit"
-
-    def is_artifact_sentence(sentence: Any) -> bool:
-        s = normalize_text(sentence).lower()
-        if not s:
-            return True
-        blocked_markers = (
-            "candidate taxonomy tags",
-            "candidate anti-signal tags",
-            "signals:",
-            "headline:",
-            "summary:",
-            "current role.",
-            "recent role.",
-            "earlier role.",
-            "production impact.",
-            "taxonomy tags",
-            "anti-signal tags",
-        )
-        if any(marker in s for marker in blocked_markers):
-            return True
-
-        artifact_runs = (
-            ("retrieval", "ranking", "search"),
-            ("production", "deployment"),
-            ("evaluation", "experimentation"),
-            ("embeddings", "vector", "database"),
-            ("hybrid search", "dense retrieval"),
-        )
-        if any(all(term in s for term in run) for run in artifact_runs):
-            action_terms = (
-                "built",
-                "built from scratch",
-                "developed",
-                "designed",
-                "shipped",
-                "launched",
-                "led",
-                "owned",
-                "improved",
-                "reduced",
-                "increased",
-                "decreased",
-                "optimized",
-                "optimised",
-                "deployed",
-                "served",
-                "managed",
-                "delivered",
-            )
-            if not any(term in s for term in action_terms):
-                return True
-
-        tokens = tokenize(s)
-        if len(tokens) <= 9 and sum(1 for t in tokens if t in {"retrieval", "ranking", "search", "production", "evaluation", "embedding", "embeddings", "vector", "systems"}) >= 3:
-            return True
-        return False
-
-    def clean_sentence_pool(texts: list[Any]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for text in texts:
-            s = clamp_snippet(text)
-            if not s or is_artifact_sentence(s):
-                continue
-            key = s.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(s)
-        return out
-
-    candidate_sentences = clean_sentence_pool(raw_sentences)
-    achievement_sentences = clean_sentence_pool(achievement_snippets)
-    sentence_pool = candidate_sentences + achievement_sentences
-
-    production_terms = ("production", "deployed", "shipped", "launched", "served", "users", "customers", "live", "scale", "latency", "throughput")
-    retrieval_terms = ("retrieval", "ranking", "search", "recommendation", "rerank", "reranking", "embedding", "embeddings", "vector", "hybrid search", "dense retrieval")
-    evaluation_terms = ("evaluation", "ndcg", "mrr", "map", "offline", "online", "a/b", "ab test", "interleaving", "relevance benchmark")
-    systems_terms = ("system", "architecture", "pipeline", "observability", "monitoring", "rollback", "incident", "latency", "throughput")
-    ownership_terms = ("ownership", "owned", "owning", "led", "architected", "built from scratch", "end to end", "cross functional", "mentored", "stakeholder")
-    recruiter_domain_terms = ("hr", "recruiting", "talent", "ats", "hiring", "candidate", "recruiter")
-    communication_terms = ("async", "asynchronous", "disagree", "disagreement", "documentation", "docs", "decision making", "communication", "writing")
-    advanced_terms = ("graphrag", "graph rag", "knowledge graph", "neo4j", "entity resolution", "graph search")
-    reason_stop_terms = {"candidate", "candidates", "evidence", "experience", "profile", "work", "role", "job", "jobs"}
-
-    scored_chunk_terms: tuple[str, ...] = tuple(
-        dict.fromkeys(
-            term.lower()
-            for _, idx in pos[:5]
-            for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query)
-            if term and len(term) >= 2 and term.lower() not in reason_stop_terms
-        )
+    banned_output_terms = (
+        "semantic score",
+        "coverage score",
+        "evidence density",
+        "cross encoder",
+        "cross-encoder",
+        "bm25",
+        "biencoder",
+        "bi-encoder",
+        "adaptive fusion",
+        "bvs",
+        "penalty multiplier",
+        "wrapper",
+        "framework-heavy",
+        "wrapper-heavy",
+        "consulting-heavy",
+        "research-oriented",
     )
 
-    family_peaks: dict[str, float] = {}
-    for score, idx in pos[:8]:
-        family = chunk_family(chunks[idx].id)
-        if family not in family_peaks or score > family_peaks[family]:
-            family_peaks[family] = score
+    def has_banned_output_term(text: str) -> bool:
+        text_l = text.lower()
+        return any(term in text_l for term in banned_output_terms)
 
-    family_count = len(family_peaks)
-    total_family_peak = sum(family_peaks.values()) if family_peaks else 0.0
-    top_family = max(family_peaks, key=family_peaks.get) if family_peaks else "UNKNOWN"
-    top_family_share = (family_peaks[top_family] / total_family_peak) if total_family_peak > 0.0 and top_family in family_peaks else 0.0
-    pos_total = sum(score for score, _ in pos[:5])
-    pos_mean = pos_total / float(max(1, min(5, len(pos))))
-
-    text_blob = normalize_text(" ".join([
-        candidate_text,
-        normalize_text(candidate.bvs_strengths),
-        normalize_text(candidate.bvs_penalties),
-    ])).lower()
-
-    archetype_scores = {
-        "production": (
-            2.6 * count_terms(text_blob, production_terms)
-            + 1.6 * family_peaks.get("SYSTEMS", 0.0)
-            + 1.2 * family_peaks.get("PRODUCT", 0.0)
-            + 0.5 * family_peaks.get("ADVANCED", 0.0)
-            + 0.3 * count_terms(text_blob, ownership_terms)
-        ),
-        "retrieval": (
-            2.7 * count_terms(text_blob, retrieval_terms)
-            + 1.7 * family_peaks.get("RETRIEVAL", 0.0)
-            + 0.5 * family_peaks.get("EVALUATION", 0.0)
-            + 0.2 * family_peaks.get("SYSTEMS", 0.0)
-        ),
-        "evaluation": (
-            2.5 * count_terms(text_blob, evaluation_terms)
-            + 1.7 * family_peaks.get("EVALUATION", 0.0)
-            + 0.4 * family_peaks.get("RETRIEVAL", 0.0)
-            + 0.2 * family_peaks.get("SYSTEMS", 0.0)
-        ),
-        "systems": (
-            2.5 * count_terms(text_blob, systems_terms)
-            + 1.8 * family_peaks.get("SYSTEMS", 0.0)
-            + 1.0 * family_peaks.get("ADVANCED", 0.0)
-            + 0.4 * family_peaks.get("PRODUCT", 0.0)
-        ),
-        "ownership": (
-            2.6 * count_terms(text_blob, ownership_terms)
-            + 1.4 * family_peaks.get("PRODUCT", 0.0)
-            + 1.0 * family_peaks.get("SYSTEMS", 0.0)
-            + 0.3 * family_peaks.get("RETRIEVAL", 0.0)
-        ),
-        "breadth": (
-            0.9 * family_count
-            + 0.8 * (1.0 - top_family_share)
-            + 0.2 * min(6, len(pos))
-            + 0.2 * pos_mean
-        ),
-        "balanced": (
-            1.0
-            + 1.5 * (1.0 - top_family_share)
-            + 0.3 * family_count
-            + 0.2 * min(5, len(pos))
-            - 0.15 * abs(family_count - 4)
-        ),
-        "recruiter_domain": (
-            2.6 * count_terms(text_blob, recruiter_domain_terms)
-            + 1.7 * family_peaks.get("DOMAIN", 0.0)
-            + 1.0 * family_peaks.get("CULTURE", 0.0)
-            + 0.3 * count_terms(text_blob, communication_terms)
-        ),
-        "direct_fit": (
-            0.85 * pos_total
-            + 0.65 * family_count
-            + 0.75 * (1.0 - top_family_share)
-            + 0.15 * count_terms(text_blob, production_terms + retrieval_terms + evaluation_terms + systems_terms + ownership_terms + recruiter_domain_terms)
-        ),
-    }
-
-    dominant_bucket = sorted(archetype_scores.items(), key=lambda item: (-float(item[1]), item[0]))[0][0]
-    dominant_score = float(archetype_scores[dominant_bucket])
-
-    banks = {
-        "production": [
-            "Strong production delivery is the clearest reason this profile stands out.",
-            "This candidate has shipped work that looks real and useful.",
-            "The profile reads as someone who can turn ideas into live outcomes.",
-            "Delivery in production environments is the main strength here.",
-            "The clearest read is practical work that has made it to users.",
-            "This is a builder who has moved work into production.",
-        ],
-        "retrieval": [
-            "Strong search and ranking experience is the main reason this profile fits.",
-            "This candidate has direct experience with retrieval-heavy work.",
-            "The profile lines up well with search and ranking roles.",
-            "Hands-on relevance work is the clearest strength here.",
-            "They have practical experience building search and ranking systems.",
-            "The candidate brings direct experience from retrieval work.",
-        ],
-        "evaluation": [
-            "Measurement discipline is a major plus in this profile.",
-            "The candidate shows strong work around evaluation and validation.",
-            "This profile fits roles that depend on testing and relevance checks.",
-            "They have practical experience proving what works, not just building it.",
-            "The clearest strength is comfort with evaluation and offline review.",
-            "This is a candidate who clearly values measured results.",
-        ],
-        "systems": [
-            "Systems thinking is the strongest reason this profile works.",
-            "The candidate has clear experience with production systems and operational work.",
-            "This profile fits people who can handle architecture and reliability.",
-            "The work points to strong platform execution.",
-            "They appear comfortable with the moving parts behind shipped systems.",
-            "This is a candidate who understands how the stack holds together.",
-        ],
-        "ownership": [
-            "Clear ownership is the standout reason here.",
-            "This candidate comes across as someone who can take work end to end.",
-            "The profile shows a strong tendency to lead and carry delivery.",
-            "They have the kind of ownership recruiters look for in senior hires.",
-            "The strongest read is accountability from start to finish.",
-            "This is someone who likely keeps projects moving.",
-        ],
-        "breadth": [
-            "The profile covers several important parts of the role.",
-            "This candidate brings broad, multi-area experience.",
-            "The strongest reason here is range across the job requirements.",
-            "They show useful depth in more than one part of the stack.",
-            "Breadth is the main reason this profile is compelling.",
-            "The background feels broader than a single narrow specialty.",
-        ],
-        "balanced": [
-            "This is a well-rounded profile with several reinforcing strengths.",
-            "The candidate looks balanced rather than narrowly specialized.",
-            "The profile has no single weakness dominating the read.",
-            "Several parts of the background work together here.",
-            "This is the kind of profile that feels steady and rounded.",
-            "The candidate presents as solid across the board.",
-        ],
-        "recruiter_domain": [
-            "The candidate understands recruiter workflows and hiring context.",
-            "This profile maps well to recruiting and talent operations.",
-            "The strongest reason here is familiarity with recruiter-side work.",
-            "They appear aligned with the pace and language of hiring teams.",
-            "This candidate brings relevant domain context for the role.",
-            "The background fits the hiring side of the business well.",
-        ],
-        "direct_fit": [
-            "This candidate lines up closely with the highest-priority requirements.",
-            "The profile matches the role very cleanly.",
-            "The fit is strong across the core job requirements.",
-            "This is a direct match for the main things the role asks for.",
-            "The overall profile reads as highly aligned.",
-            "The profile is an unusually clean fit.",
-        ],
-    }
-
-    def bank_pick(bucket: str, score: float) -> str:
-        bank = banks.get(bucket, banks["direct_fit"])
-        seed = f"{candidate.candidate_id}|{bucket}|{int(round(max(0.0, score) * 1000.0))}|{len(pos)}|{len(normalize_text(candidate.bvs_strengths))}|{len(normalize_text(candidate.bvs_penalties))}"
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        return bank[int(digest[:8], 16) % len(bank)]
-
-    verified_families = top_families(pos, 1)
-    verified_phrase = family_phrase(verified_families)
-    if verified_phrase:
-        opener = f"Verified positive evidence is strongest around {verified_phrase}."
-    else:
-        opener = bank_pick(dominant_bucket, dominant_score)
-
-    def is_artifact_like(sentence: Any) -> bool:
-        s = normalize_text(sentence).lower()
-        if not s:
+    def is_artifact_sentence(text: Any) -> bool:
+        sentence_l = normalize_text(text).lower()
+        if not sentence_l or has_banned_output_term(sentence_l):
             return True
         blocked = (
             "candidate taxonomy tags",
@@ -3224,25 +2917,133 @@ def make_reasoning(
             "signals:",
             "taxonomy tags",
             "anti-signal tags",
-            "headline:",
-            "summary:",
             "current role.",
             "recent role.",
             "earlier role.",
             "production impact.",
+            "production impact",
+            "most recent evidence",
+            "fresh evidence",
+            "historical context",
         )
-        if any(x in s for x in blocked):
+        if any(marker in sentence_l for marker in blocked):
             return True
-        if len(tokenize(s)) <= 9 and sum(1 for t in tokenize(s) if t in {"retrieval", "ranking", "search", "production", "evaluation", "embedding", "embeddings", "vector", "systems"}) >= 3:
+        tokens = tokenize(sentence_l)
+        if len(tokens) <= 8 and sum(1 for token in tokens if token in {"retrieval", "ranking", "search", "production", "evaluation", "systems"}) >= 3:
             return True
         return False
 
-    def candidate_sentence_score(sentence: Any, terms: tuple[str, ...], used_topics: set[str]) -> tuple[float, int]:
-        s = clamp_snippet(sentence)
-        s_l = s.lower()
-        if len(s) < 24 or is_artifact_like(s):
-            return (-1.0, 0)
-        overlap = sum(1 for term in terms if term and term in s_l)
+    candidate_text = normalize_text(candidate.candidate_text)
+    raw_sentences = [
+        clean_snippet(sentence)
+        for sentence in SENTENCE_RE.split(candidate_text)
+        if clean_snippet(sentence)
+    ]
+    achievement_sentences = [
+        clean_snippet(sentence)
+        for sentence in extract_achievement_snippets(candidate_text)
+        if clean_snippet(sentence)
+    ] if candidate_text else []
+
+    sentence_pool: list[str] = []
+    seen_sentences: set[str] = set()
+    for sentence in raw_sentences + achievement_sentences:
+        if is_artifact_sentence(sentence):
+            continue
+        key = sentence.lower()
+        if key in seen_sentences:
+            continue
+        seen_sentences.add(key)
+        sentence_pool.append(sentence)
+
+    text_blob = normalize_text(" ".join([
+        candidate_text,
+        normalize_text(candidate.bvs_strengths),
+        normalize_text(candidate.bvs_penalties),
+    ])).lower()
+
+    def text_has_any(terms: tuple[str, ...]) -> bool:
+        return any(term in text_blob for term in terms)
+
+    production_terms = ("production", "deployed", "shipped", "launched", "served", "users", "customers", "live", "scale", "latency", "throughput")
+    retrieval_terms = ("retrieval", "search", "semantic search", "hybrid search", "dense retrieval", "embedding", "embeddings")
+    ranking_terms = ("ranking", "ranker", "rerank", "reranking", "recommendation", "recommender")
+    vector_terms = ("vector", "vector database", "faiss", "milvus", "pinecone", "weaviate", "qdrant", "chroma", "ann")
+    evaluation_terms = ("evaluation", "ndcg", "mrr", "map", "a/b", "ab test", "offline", "online", "interleaving", "relevance")
+    systems_terms = ("system", "systems", "architecture", "pipeline", "observability", "monitoring", "rollback", "incident")
+    ownership_terms = ("owned", "owning", "led", "architected", "built from scratch", "end to end", "cross functional", "stakeholder")
+    migration_terms = ("migration", "migrated", "modernized", "modernised", "replatformed", "rebuilt")
+    impact_terms = ("%", "improved", "reduced", "increased", "saved", "engagement", "conversion", "accuracy", "revenue", "cost")
+    scale_terms = ("users", "queries", "requests", "documents", "candidates", "million", "billion", "qps", "latency", "throughput")
+    deployment_terms = ("a/b testing", "ab testing", "rollout", "rolled out", "monitoring", "versioning", "rollback", "production", "serving", "kubernetes", "distributed")
+    leadership_terms = ("mentored", "owned roadmap", "cross-functional", "cross functional", "tech lead", "stakeholders")
+    recruiter_terms = ("recruiter", "recruiting", "talent", "ats", "hiring", "candidate workflow")
+    marketplace_terms = ("marketplace", "matching", "supply", "demand", "two-sided")
+    writing_terms = ("async", "asynchronous", "documentation", "docs", "writing", "design doc", "decision memo")
+
+    def family_set(items: list[tuple[float, int]]) -> set[str]:
+        return {chunk_family(chunks[idx].id) for _, idx in items if 0 <= idx < len(chunks)}
+
+    verified_families = family_set(positive)
+
+    strengths: list[tuple[int, str, tuple[str, ...]]] = []
+
+    def add_strength(priority: int, label: str, terms: tuple[str, ...], supported: bool) -> None:
+        if supported and all(existing != label for _, existing, _ in strengths):
+            strengths.append((priority, label, terms))
+
+    has_production = text_has_any(production_terms)
+    has_retrieval = text_has_any(retrieval_terms)
+    has_ranking = text_has_any(ranking_terms)
+    has_vector = text_has_any(vector_terms)
+    has_evaluation = text_has_any(evaluation_terms)
+    has_systems = text_has_any(systems_terms)
+    has_ownership = text_has_any(ownership_terms)
+
+    add_strength(
+        0,
+        "production search and retrieval systems",
+        production_terms + retrieval_terms + ranking_terms,
+        has_production and (has_retrieval or has_ranking or "RETRIEVAL" in verified_families),
+    )
+    add_strength(1, "search and retrieval", retrieval_terms, has_retrieval or "RETRIEVAL" in verified_families)
+    add_strength(2, "ranking or recommendation systems", ranking_terms, has_ranking or "RETRIEVAL" in verified_families)
+    add_strength(3, "vector search and embeddings", vector_terms + retrieval_terms, has_vector)
+    add_strength(4, "evaluation and relevance measurement", evaluation_terms, has_evaluation or "EVALUATION" in verified_families)
+    add_strength(5, "production deployment", production_terms, has_production or "PRODUCT" in verified_families)
+    add_strength(6, "systems engineering", systems_terms, has_systems or "SYSTEMS" in verified_families)
+    add_strength(7, "ownership and delivery", ownership_terms, has_ownership or "PRODUCT" in verified_families)
+    add_strength(8, "recruiter workflow context", recruiter_terms, text_has_any(recruiter_terms) or "DOMAIN" in verified_families)
+    add_strength(9, "marketplace or matching systems", marketplace_terms, text_has_any(marketplace_terms))
+    add_strength(10, "written collaboration", writing_terms, text_has_any(writing_terms) or "CULTURE" in verified_families)
+
+    if not strengths and positive:
+        top_family = chunk_family(chunks[positive[0][1]].id)
+        fallback_labels = {
+            "RETRIEVAL": "search and retrieval",
+            "EVALUATION": "evaluation and relevance measurement",
+            "SYSTEMS": "systems engineering",
+            "PRODUCT": "production delivery",
+            "DOMAIN": "recruiter workflow context",
+            "CULTURE": "written collaboration",
+            "ADVANCED": "advanced AI work",
+        }
+        add_strength(20, fallback_labels.get(top_family, "core role requirements"), tuple(chunks[positive[0][1]].terms), True)
+
+    strengths.sort(key=lambda item: item[0])
+    primary_strength = strengths[0][1] if strengths else "the role requirements"
+    secondary_strengths = [label for _, label, _ in strengths[1:4]]
+
+    def deterministic_pick(options: list[str], salt: str) -> str:
+        if not options:
+            return ""
+        seed = f"{candidate.candidate_id}|{salt}|{primary_strength}|{len(positive)}|{len(background_positive)}"
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        return options[int(digest[:8], 16) % len(options)]
+
+    def snippet_score(sentence: str, terms: tuple[str, ...]) -> tuple[float, int]:
+        sentence_l = sentence.lower()
+        overlap = sum(1 for term in terms if term and term in sentence_l)
         if overlap <= 0:
             return (-1.0, 0)
         action_bonus = sum(
@@ -3250,337 +3051,392 @@ def make_reasoning(
             for term in (
                 "built",
                 "developed",
+                "designed",
                 "shipped",
                 "launched",
-                "designed",
-                "led",
+                "deployed",
                 "owned",
+                "led",
                 "improved",
-                "reduced",
-                "increased",
-                "decreased",
                 "optimized",
                 "optimised",
-                "deployed",
                 "served",
-                "managed",
-                "delivered",
+                "scaled",
             )
-            if term in s_l
+            if term in sentence_l
         )
-        metric_bonus = 1 if re.search(r"\b\d+(?:\.\d+)?\s*(?:%|x|ms|s|sec|secs|seconds|minutes|hours|days|day|weeks|month|months|million|billion|k|m)\b", s_l) else 0
-        topic = sentence_topic(s)
-        topic_penalty = 1 if topic in used_topics else 0
-        style_penalty = 1 if sentence_overlap_ratio(s, opener) > 0.55 else 0
-        score = overlap + action_bonus + metric_bonus - topic_penalty - style_penalty
-        return (float(score), overlap)
+        metric_bonus = 1 if re.search(r"\b\d+(?:\.\d+)?\s*(?:%|x|ms|s|sec|secs|seconds|minutes|hours|days|weeks|months|million|billion|k|m)\b", sentence_l) else 0
+        return (float(overlap + action_bonus + metric_bonus), overlap)
 
-    archetype_terms = {
-        "production": production_terms + systems_terms + ownership_terms,
-        "retrieval": retrieval_terms + systems_terms,
-        "evaluation": evaluation_terms + retrieval_terms,
-        "systems": systems_terms + production_terms,
-        "ownership": ownership_terms + production_terms,
-        "breadth": production_terms + retrieval_terms + evaluation_terms + systems_terms + ownership_terms + recruiter_domain_terms,
-        "balanced": production_terms + retrieval_terms + evaluation_terms + systems_terms + ownership_terms + recruiter_domain_terms,
-        "recruiter_domain": recruiter_domain_terms + communication_terms,
-        "direct_fit": production_terms + retrieval_terms + evaluation_terms + systems_terms + ownership_terms + recruiter_domain_terms,
+    def recruiter_display_priority(sentence: str, semantic_relevance: float, sentence_index: int) -> float:
+        sentence_l = sentence.lower()
+
+        def hits(terms: tuple[str, ...]) -> int:
+            return sum(1 for term in terms if term in sentence_l)
+
+        ownership_hits = hits((
+            "led",
+            "owned",
+            "designed",
+            "built",
+            "architected",
+            "implemented",
+            "migrated",
+            "launched",
+        ))
+        migration_hits = hits(migration_terms)
+        scale_hits = hits((
+            "users",
+            "queries",
+            "requests",
+            "documents",
+            "candidates",
+            "million",
+            "billion",
+            "qps",
+            "latency",
+            "throughput",
+        ))
+        impact_hits = hits(impact_terms + ("ctr", "ndcg", "mrr", "recall@k"))
+        deployment_hits = hits((
+            "a/b testing",
+            "ab testing",
+            "rolled out",
+            "rollout",
+            "monitoring",
+            "versioning",
+            "rollback",
+            "production",
+            "serving",
+            "kubernetes",
+            "distributed",
+        ))
+        evaluation_hits = hits(evaluation_terms)
+        leadership_hits = hits(leadership_terms)
+        tool_hits = hits(("faiss", "pinecone", "milvus", "weaviate", "qdrant", "langchain", "llamaindex"))
+        recent_hint = min(1.0, sentence_index / float(max(1, len(sentence_pool) - 1)))
+        production_ownership_hits = min(2, ownership_hits) if any(term in sentence_l for term in production_terms + retrieval_terms + ranking_terms) else 0
+        recent_achievement_bonus = recent_hint if any(term in sentence_l for term in ownership_terms + scale_terms + impact_terms + deployment_terms) else 0.0
+        return (
+            0.20 * semantic_relevance
+            + 18.0 * production_ownership_hits
+            + 13.0 * min(2, scale_hits)
+            + 11.0 * min(2, impact_hits)
+            + 9.0 * min(2, deployment_hits)
+            + 8.0 * min(2, migration_hits)
+            + 7.0 * min(2, leadership_hits)
+            + 5.0 * min(2, evaluation_hits)
+            + 1.0 * min(2, tool_hits)
+            + 3.50 * recent_achievement_bonus
+        )
+
+    target_terms: tuple[str, ...] = tuple(dict.fromkeys(
+        strengths[0][2]
+        + tuple(term for _, idx in positive[:4] for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query))
+        if strengths
+        else tuple(term for _, idx in positive[:4] for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query))
+    ))
+
+    scored_snippets: list[tuple[float, float, int, str]] = []
+    for sent_idx, sentence in enumerate(sentence_pool):
+        score, overlap = snippet_score(sentence, target_terms)
+        if score <= 0.0 or overlap <= 0:
+            continue
+        display_priority = recruiter_display_priority(sentence, score, sent_idx)
+        scored_snippets.append((display_priority, score, sent_idx, sentence))
+    scored_snippets.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+
+    evidence_snippet = scored_snippets[0][3] if scored_snippets else ""
+
+    def evidence_category(sentence: str) -> str:
+        sentence_l = sentence.lower()
+
+        def has_any(terms: tuple[str, ...]) -> bool:
+            return any(term in sentence_l for term in terms)
+
+        has_owner = has_any(ownership_terms + ("designed", "built", "implemented", "launched"))
+        has_delivery = has_any(production_terms + deployment_terms)
+        has_search = has_any(retrieval_terms + ranking_terms)
+        if has_owner and has_delivery and has_search:
+            return "production_ownership"
+        if has_any(migration_terms):
+            return "migration"
+        if has_delivery and has_any(scale_terms):
+            return "scale_deployment"
+        if has_any(impact_terms):
+            return "business_impact"
+        if has_search and has_owner:
+            return "ranking_ownership"
+        if has_search:
+            return "retrieval"
+        if has_any(evaluation_terms):
+            return "evaluation"
+        if has_any(systems_terms):
+            return "systems"
+        if text_has_any(recruiter_terms):
+            return "recruiter_domain"
+        return "general_fit"
+
+    opening_category = evidence_category(evidence_snippet)
+    category_opening_templates = {
+        "production_ownership": [
+            "Strong production ownership of search and ranking systems makes this candidate worth interviewing.",
+            "Clear ownership of production retrieval work is the strongest hiring signal in this profile.",
+            "Hands-on delivery of production search infrastructure gives this profile a strong interview case.",
+        ],
+        "migration": [
+            "Experience modernizing search infrastructure is the strongest reason to interview this candidate.",
+            "Search infrastructure migration experience gives this profile a concrete hiring hook.",
+            "The strongest signal is practical ownership of modernizing retrieval or ranking systems.",
+        ],
+        "scale_deployment": [
+            "Demonstrated success deploying retrieval systems at scale makes this profile stand out.",
+            "Scaled production delivery is the clearest reason this candidate deserves interview time.",
+            "The profile is strongest where it shows production systems serving meaningful scale.",
+        ],
+        "business_impact": [
+            "Measurable product impact from search or ML work makes this candidate worth a closer look.",
+            "The strongest hiring signal is evidence of technical work tied to measurable outcomes.",
+            "Impact-oriented delivery gives this profile a stronger interview case than tool familiarity alone.",
+        ],
+        "ranking_ownership": [
+            "Clear hands-on ranking system work makes this candidate worth interviewing.",
+            "Ranking and recommendation ownership is the strongest reason to advance this profile.",
+            "The profile stands out where it connects ranking work with practical delivery ownership.",
+        ],
+        "retrieval": [
+            "Hands-on retrieval and search infrastructure experience is the clearest interview reason.",
+            "Direct search and retrieval work gives this candidate a credible technical match.",
+            "The profile stands out most for practical retrieval experience aligned with the role.",
+        ],
+        "evaluation": [
+            "Practical ranking-quality evaluation experience gives this candidate a strong technical hook.",
+            "The profile is compelling where it shows comfort validating search and ranking quality.",
+            "Evaluation depth around retrieval or ranking systems makes this profile worth reviewing.",
+        ],
+        "systems": [
+            "Strong systems ownership around production ML infrastructure makes the profile credible.",
+            "Architecture and operational systems work provide the strongest interview signal here.",
+            "Production systems depth gives this candidate a credible base for the role.",
+        ],
+        "recruiter_domain": [
+            "Recruiter workflow context gives this candidate useful product proximity for the role.",
+            "Experience near hiring or talent workflows strengthens the interview case for this profile.",
+            "Domain exposure to recruiting workflows makes the technical fit more relevant.",
+        ],
+        "general_fit": [
+            "The profile shows enough aligned technical evidence to merit an interview conversation.",
+            "Multiple parts of the profile line up with the role's core engineering needs.",
+            "The candidate has credible technical overlap with the role's search and ML priorities.",
+        ],
     }
-    target_terms = tuple(
-        dict.fromkeys(scored_chunk_terms + archetype_terms.get(dominant_bucket, archetype_terms["direct_fit"]))
+    opening = deterministic_pick(
+        category_opening_templates.get(opening_category, category_opening_templates["general_fit"]),
+        f"opening-{opening_category}",
     )
 
-    used_topics: set[str] = {dominant_bucket}
-    evidence_snippets: list[str] = []
+    support_sentence = ""
+    if evidence_snippet:
+        support_sentence = deterministic_pick(
+            [
+                "The strongest example is direct: {snippet}.",
+                "The clearest achievement is concrete: {snippet}.",
+                "The best supporting evidence is practical: {snippet}.",
+                "Recent evidence makes the case: {snippet}.",
+                "The profile gives a specific example: {snippet}.",
+                "A high-value example stands out: {snippet}.",
+                "The interview case is backed by this detail: {snippet}.",
+            ],
+            "support",
+        ).format(snippet=evidence_snippet)
+    elif secondary_strengths:
+        support_sentence = f"Additional alignment in {', '.join(secondary_strengths[:2])} broadens the fit beyond a single area."
 
-    pool = sentence_pool
-    scored_pool: list[tuple[float, int, str]] = []
-    for idx, sentence in enumerate(pool):
-        score, _ = candidate_sentence_score(sentence, target_terms, used_topics)
-        if score <= 0:
-            continue
-        scored_pool.append((score, idx, clamp_snippet(sentence)))
-    scored_pool.sort(key=lambda item: (-item[0], item[1]))
+    def concern_from_chunk(chunk_id: str) -> str:
+        return {
+            "C19": "production deployment is weaker than the research-led signal",
+            "C20": "retrieval depth is weaker than surface-level AI tooling evidence",
+            "C21": "hands-on coding depth may be weaker than architecture or management signals",
+            "C22": "domain fit leans more toward computer vision, speech, or robotics than search",
+            "C23": "product ownership may be diluted by consulting or closed-source services work",
+            "C24": "systems depth may lean closer to prototypes or demos than production infrastructure",
+        }.get(chunk_id, "")
 
-    for _, _, sentence in scored_pool:
-        topic = sentence_topic(sentence)
-        if topic in used_topics and evidence_snippets:
-            continue
-        if any(sentence_overlap_ratio(sentence, prev) > 0.62 for prev in evidence_snippets):
-            continue
-        evidence_snippets.append(sentence)
-        used_topics.add(topic)
-        if len(evidence_snippets) >= 2:
-            break
-
-    if not evidence_snippets and pool:
-        for sentence in pool:
-            if not is_artifact_like(sentence):
-                evidence_snippets.append(clamp_snippet(sentence))
-                break
-
-    def translate_strength(raw: Any) -> tuple[str, str]:
+    def concern_from_penalty(raw: Any) -> tuple[str, float]:
         raw_l = normalize_text(raw).lower()
-        if raw_l.startswith("location="):
-            return "balanced", "location fit is strong"
-        if raw_l.startswith("target_yoe="):
-            return "balanced", "experience level matches the target band"
-        if raw_l.startswith("acceptable_yoe="):
-            return "balanced", "experience level is close to the target band"
-        if raw_l.startswith("near_band_yoe="):
-            return "balanced", "experience level is near the target band"
-        if raw_l == "open_to_work":
-            return "activity", "actively open to opportunities"
-        if raw_l == "very_recent_activity":
-            return "activity", "very recent activity"
-        if raw_l == "recent_activity":
-            return "activity", "recent activity"
-        if raw_l == "moderate_activity":
-            return "activity", "steady recent activity"
-        if raw_l == "recent_platform_signup":
-            return "activity", "recent profile activity"
-        if raw_l == "established_platform_history":
-            return "activity", "an established profile history"
-        if raw_l.startswith("recruiter_response_rate="):
-            return "activity", "strong recruiter response history"
-        if raw_l.startswith("avg_response_time="):
-            return "activity", "fast candidate response time"
-        if raw_l.startswith("notice_period="):
-            return "activity", "manageable notice period"
-        if raw_l in {"ownership", "leadership", "end to end", "cross functional"}:
-            return "ownership", "clear ownership"
-        if raw_l == "production deployment":
-            return "production", "production delivery"
-        if raw_l == "systems":
-            return "systems", "systems thinking"
-        if raw_l == "evaluation":
-            return "evaluation", "evaluation experience"
-        if raw_l == "retrieval":
-            return "retrieval", "retrieval expertise"
-        if raw_l == "domain":
-            return "recruiter_domain", "recruiter-domain experience"
-        if raw_l == "culture":
-            return "communication", "communication strength"
-        if raw_l == "advanced":
-            return "advanced", "advanced problem-solving"
-        return "balanced", normalize_text(raw).replace("_", " ").replace("=", ": ")
-
-    def translate_penalty(raw: Any) -> tuple[str, str, int]:
-        raw_l = normalize_text(raw).lower()
-        if raw_l in {"geography_mismatch", "outside_india_and_no_relocation"}:
-            return "balanced", "location fit is weaker", 3
-        if raw_l == "extreme_notice_period":
-            return "activity", "the notice period is very long", 3
-        if raw_l == "stale_and_unresponsive":
-            return "activity", "the profile looks stale and hard to engage", 3
+        if raw_l in {"research_only_like"}:
+            return "production deployment is weaker than the research-led signal", 0.24
+        if raw_l in {"wrapper_only_like"}:
+            return "retrieval depth is weaker than surface-level AI tooling evidence", 0.22
+        if raw_l in {"framework_demo_only_like"}:
+            return "systems depth may lean closer to prototypes or demos than production infrastructure", 0.20
+        if raw_l in {"wrong_domain_like", "title_skill_mismatch"}:
+            return "", 0.0
+        if raw_l in {"limited_evaluation_terms"}:
+            return "retrieval evidence is stronger than ranking-quality evaluation experience", 0.24
+        if raw_l in {"limited_retrieval_depth"}:
+            return "broader production or systems evidence is stronger than retrieval depth", 0.24
         if raw_l.startswith("outside_jd_band="):
-            return "balanced", "experience is outside the target band", 2
-        if raw_l.startswith("low_recruiter_response_rate="):
-            return "activity", "response history is limited", 2
-        if raw_l.startswith("slow_response="):
-            return "activity", "response time is slower", 2
-        if raw_l == "stale_activity":
-            return "activity", "recent activity is limited", 2
-        if raw_l == "invalid_profile_quality":
-            return "balanced", "profile completeness is limited", 3
-        if raw_l == "aging_activity":
-            return "activity", "recent activity is a bit older", 1
+            return "level fit may need calibration against the preferred experience band", 0.23
         if raw_l.startswith("notice_period="):
             match = re.search(r"notice_period=(\d+)d", raw_l)
             days = as_int(match.group(1), 0) if match else 0
             if days >= 60:
-                return "activity", "the notice period is long", 2
-            return "activity", "the notice period is a bit longer", 1
-        return "balanced", normalize_text(raw).replace("_", " ").replace("=", ": "), 1
+                return "notice period may affect immediate availability", 0.26 if days >= 120 else 0.21
+        if raw_l.startswith("job_hopping"):
+            return "recent role tenure appears shorter than ideal", 0.21
+        if raw_l.startswith("consulting_service_background"):
+            return "product ownership may be diluted by consulting or services signals", 0.18
+        return "", 0.0
 
-    def select_secondary_strength() -> str | None:
-        strengths_raw = [normalize_text(s) for s in (candidate.bvs_strengths or []) if normalize_text(s)]
-        if not strengths_raw:
-            return None
+    def contradicts_strength(phrase: str) -> bool:
+        phrase_l = phrase.lower()
+        if not phrase_l:
+            return True
+        if has_production and "production deployment is weaker" in phrase_l:
+            return True
+        if has_ownership and "hands-on coding depth may be weaker" in phrase_l:
+            return True
+        if has_retrieval and "retrieval depth is weaker" in phrase_l:
+            return True
+        if has_systems and "systems depth may lean closer" in phrase_l:
+            return True
+        return False
 
-        priority = {
-            "production": ("ownership", "systems", "evaluation", "retrieval", "recruiter_domain", "activity", "balanced"),
-            "retrieval": ("evaluation", "ownership", "systems", "production", "recruiter_domain", "activity", "balanced"),
-            "evaluation": ("retrieval", "ownership", "systems", "production", "recruiter_domain", "activity", "balanced"),
-            "systems": ("production", "ownership", "evaluation", "retrieval", "recruiter_domain", "activity", "balanced"),
-            "ownership": ("production", "systems", "retrieval", "evaluation", "recruiter_domain", "activity", "balanced"),
-            "breadth": ("production", "ownership", "systems", "retrieval", "evaluation", "recruiter_domain", "activity", "balanced"),
-            "balanced": ("production", "ownership", "retrieval", "evaluation", "systems", "recruiter_domain", "activity", "breadth"),
-            "recruiter_domain": ("communication", "production", "ownership", "systems", "evaluation", "retrieval", "activity", "balanced"),
-            "direct_fit": ("production", "ownership", "retrieval", "evaluation", "systems", "recruiter_domain", "communication", "activity", "breadth"),
-        }
+    strong_positive_count = len(positive) + len(background_positive)
+    strong_positive_case = strong_positive_count >= 3 and bool(strengths)
+    verified_negative_threshold = 0.34 if strong_positive_case else 0.30
+    structured_weakness_threshold = 0.28 if strong_positive_case else 0.24
+    background_negative_threshold = 0.55 if strong_positive_case else 0.48
+    recruiter_constraint_threshold = 0.30 if strong_positive_case else 0.26
+    meaningful_score_reduction_threshold = 0.20
+    selected_concern = ""
 
-        def bucket_of_strength(raw: str) -> str:
+    def verified_negative_risk_estimate(items: list[tuple[float, int]]) -> float:
+        ordered_scores = sorted((float(score) for score, _ in items), reverse=True)[:2]
+        if not ordered_scores:
+            return 0.0
+        max_score = ordered_scores[0]
+        mean_score = float(sum(ordered_scores) / len(ordered_scores))
+        return clamp01((0.70 * max_score) + (0.30 * mean_score))
+
+    def background_negative_risk_estimate(items: list[tuple[float, int]]) -> float:
+        if not items:
+            return 0.0
+        weighted_scores = [float(score) for score, _ in items]
+        weighted_mean = float(sum(weighted_scores) / len(weighted_scores))
+        weighted_consensus = float(sum(1 for score in weighted_scores if score >= 0.60) / len(weighted_scores))
+        return clamp01((0.60 * weighted_mean) + (0.40 * weighted_consensus))
+
+    verified_risk = verified_negative_risk_estimate(negative)
+    background_risk = background_negative_risk_estimate(background_negative)
+
+    def meaningful_ce_score_reduction(verified_component: float, background_component: float) -> bool:
+        combined_risk = clamp01((0.70 * verified_component) + (0.30 * background_component))
+        score_reduction = 1.0 - math.exp(-max(0.0, combined_risk) * 2.4)
+        return score_reduction >= meaningful_score_reduction_threshold
+
+    def strongest_verified_concern() -> str:
+        ordered = sorted(negative, key=lambda item: (-float(item[0]), chunks[item[1]].id))
+        if not ordered:
+            return ""
+        score, idx = ordered[0]
+        if score < verified_negative_threshold:
+            return ""
+        if not meaningful_ce_score_reduction(verified_risk, background_risk):
+            return ""
+        phrase = concern_from_chunk(chunks[idx].id)
+        return phrase if phrase and not contradicts_strength(phrase) else ""
+
+    def strongest_background_concern() -> str:
+        ordered = sorted(background_negative, key=lambda item: (-float(item[0]), chunks[item[1]].id))
+        if not ordered:
+            return ""
+        score, idx = ordered[0]
+        if score < background_negative_threshold:
+            return ""
+        if chunks[idx].id == "C22":
+            return ""
+        if not meaningful_ce_score_reduction(0.0, background_risk):
+            return ""
+        phrase = concern_from_chunk(chunks[idx].id)
+        return phrase if phrase and not contradicts_strength(phrase) else ""
+
+    recruiter_constraint_prefixes = ("outside_jd_band=", "notice_period=", "job_hopping")
+
+    def penalty_group(raw_l: str) -> int:
+        if raw_l.startswith(recruiter_constraint_prefixes):
+            return 2
+        return 1
+
+    def strongest_penalty_concern(group: int, threshold: float) -> str:
+        candidates_for_group: list[tuple[float, str]] = []
+        for raw in candidate.bvs_penalties or []:
             raw_l = normalize_text(raw).lower()
-            if raw_l.startswith("location="):
-                return "balanced"
-            if raw_l.startswith("target_yoe=") or raw_l.startswith("acceptable_yoe=") or raw_l.startswith("near_band_yoe="):
-                return "balanced"
-            if raw_l in {"open_to_work", "very_recent_activity", "recent_activity", "moderate_activity", "recent_platform_signup", "established_platform_history"}:
-                return "activity"
-            if raw_l.startswith("recruiter_response_rate=") or raw_l.startswith("avg_response_time=") or raw_l.startswith("notice_period="):
-                return "activity"
-            if raw_l in {"ownership", "leadership", "end to end", "cross functional"}:
-                return "ownership"
-            if raw_l in {"production deployment"}:
-                return "production"
-            if raw_l in {"systems"}:
-                return "systems"
-            if raw_l in {"evaluation"}:
-                return "evaluation"
-            if raw_l in {"retrieval"}:
-                return "retrieval"
-            if raw_l in {"domain"}:
-                return "recruiter_domain"
-            if raw_l in {"culture"}:
-                return "communication"
-            if raw_l in {"advanced"}:
-                return "advanced"
-            return "balanced"
-
-        translated_map = [(bucket_of_strength(raw), phrase) for raw, phrase in (translate_strength(s) for s in strengths_raw)]
-        skip_behavioral_secondary = bool(evidence_snippets)
-        seen: set[str] = set()
-        for bucket in priority.get(dominant_bucket, ("production", "ownership", "retrieval", "evaluation", "systems", "recruiter_domain", "communication", "activity", "balanced")):
-            if bucket == dominant_bucket:
+            if penalty_group(raw_l) != group:
                 continue
-            for raw_bucket, phrase in translated_map:
-                if skip_behavioral_secondary and raw_bucket in {"activity", "balanced"}:
-                    continue
-                key = phrase.lower()
-                if raw_bucket == bucket and key not in seen and all(key not in e.lower() for e in evidence_snippets):
-                    seen.add(key)
-                    return phrase
-
-        for raw_bucket, phrase in translated_map:
-            if skip_behavioral_secondary and raw_bucket in {"activity", "balanced"}:
+            if raw_l == "research_only_like" and has_production:
                 continue
-            key = phrase.lower()
-            if raw_bucket != dominant_bucket and key not in seen and all(key not in e.lower() for e in evidence_snippets):
-                return phrase
-        return None
-
-    secondary_strength = select_secondary_strength()
-
-    def select_risk() -> str | None:
-        best_risk: tuple[int, str] | None = None
-        for raw in (candidate.bvs_penalties or []):
-            _, phrase, severity = translate_penalty(raw)
-            if severity < 2:
+            if raw_l in {"wrapper_only_like", "framework_demo_only_like"} and (has_production or has_retrieval or has_systems):
                 continue
-            if best_risk is None or severity > best_risk[0]:
-                best_risk = (severity, phrase)
-        if best_risk is None:
-            return None
-        severity, phrase = best_risk
-        bank = [
-            "A real caution is {risk}.",
-            "One meaningful concern is {risk}.",
-            "The main caution is {risk}.",
-            "There is still a notable concern around {risk}.",
-            "A clear risk remains: {risk}.",
-        ]
-        seed = f"{candidate.candidate_id}|risk|{severity}|{dominant_bucket}"
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        return bank[int(digest[:8], 16) % len(bank)].format(risk=phrase)
+            if raw_l.startswith("consulting_service_background") and strong_positive_case:
+                continue
+            phrase, confidence = concern_from_penalty(raw)
+            if confidence >= threshold and phrase and not contradicts_strength(phrase):
+                candidates_for_group.append((confidence, phrase))
+        if not candidates_for_group:
+            return ""
+        candidates_for_group.sort(key=lambda item: (-item[0], item[1]))
+        return candidates_for_group[0][1]
 
-    risk_sentence = select_risk()
+    selected_concern = strongest_verified_concern()
+    if not selected_concern:
+        selected_concern = strongest_penalty_concern(1, structured_weakness_threshold)
+    if not selected_concern:
+        selected_concern = strongest_background_concern()
+    if not selected_concern:
+        selected_concern = strongest_penalty_concern(2, recruiter_constraint_threshold)
+    concerns = [selected_concern] if selected_concern else []
 
-    def make_evidence_sentence() -> str | None:
-        if not evidence_snippets:
-            return None
-        s = evidence_snippets[0]
-        bank = [
-            "A concrete example is {s}.",
-            "One clear example is {s}.",
-            "A specific example is {s}.",
-            "A strong example is {s}.",
-            "The clearest example is {s}.",
-            "A useful example is {s}.",
-        ]
-        seed = f"{candidate.candidate_id}|evidence|{dominant_bucket}|{len(evidence_snippets)}"
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        return bank[int(digest[:8], 16) % len(bank)].format(s=s)
+    closing_sentence = ""
+    if concerns:
+        concern = concerns[0]
+        closing_sentence = deterministic_pick(
+            [
+                "Recruiters should probe whether {concern}.",
+                "The one caveat worth testing is whether {concern}.",
+                "Interviewers should validate whether {concern}.",
+            ],
+            "concern",
+        ).format(concern=concern)
 
-    evidence_sentence = make_evidence_sentence()
-    verified_positive_sentence = opener
-    if verified_phrase and evidence_snippets:
-        verified_positive_sentence = f"Verified {verified_phrase} evidence: {evidence_snippets[0]}."
-    elif evidence_sentence:
-        verified_positive_sentence = evidence_sentence
+    sentences = [sentence for sentence in (opening, support_sentence, closing_sentence) if sentence]
 
-    def make_background_strength_sentence() -> str | None:
-        background_families = [family for family in top_families(background_pos, 1) if family not in verified_families]
-        if not background_families:
-            return None
-        phrase = family_phrase(background_families)
-        if not phrase:
-            return None
-        return f"Additional background semantic support shows alignment in {phrase}."
+    safe_sentences: list[str] = []
+    seen_sentence_keys: set[str] = set()
+    for sentence in sentences:
+        sentence = normalize_text(sentence).rstrip()
+        if not sentence:
+            continue
+        if not sentence.endswith("."):
+            sentence += "."
+        if has_banned_output_term(sentence):
+            continue
+        key = sentence.lower()
+        if key in seen_sentence_keys:
+            continue
+        seen_sentence_keys.add(key)
+        safe_sentences.append(sentence)
+        if len(safe_sentences) >= 3:
+            break
 
-    def make_background_risk_sentence() -> str | None:
-        phrase = risk_phrase(background_neg)
-        if not phrase:
-            return None
-        return f"Background semantic risk also points to {phrase}."
+    if not safe_sentences:
+        safe_sentences = ["The profile has relevant technical overlap, but the available narrative evidence is limited."]
 
-    def make_verified_risk_sentence() -> str | None:
-        phrase = risk_phrase(neg)
-        if not phrase:
-            return None
-        return f"Verified negative evidence raises concern around {phrase}."
-
-    background_strength_sentence = make_background_strength_sentence()
-    background_risk_sentence = make_background_risk_sentence()
-    verified_risk_sentence = make_verified_risk_sentence()
-
-    def make_secondary_sentence() -> str | None:
-        if not secondary_strength:
-            return None
-        bank = [
-            "It is also helped by {strength}.",
-            "A further plus is {strength}.",
-            "There is also {strength}.",
-            "Another useful plus is {strength}.",
-            "The profile is also helped by {strength}.",
-            "That is reinforced by {strength}.",
-        ]
-        seed = f"{candidate.candidate_id}|secondary|{dominant_bucket}"
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        return bank[int(digest[:8], 16) % len(bank)].format(strength=secondary_strength)
-
-    secondary_sentence = make_secondary_sentence()
-
-    sentences: list[str] = []
-    if verified_positive_sentence:
-        sentences.append(verified_positive_sentence)
-    if background_strength_sentence:
-        sentences.append(background_strength_sentence)
-    if secondary_sentence and not (background_strength_sentence or verified_risk_sentence or background_risk_sentence):
-        if evidence_sentence and secondary_sentence.lower() == evidence_sentence.lower():
-            secondary_sentence = None
-        if secondary_sentence:
-            sentences.append(secondary_sentence)
-    if verified_risk_sentence:
-        sentences.append(verified_risk_sentence)
-    if background_risk_sentence:
-        sentences.append(background_risk_sentence)
-    if risk_sentence and not (verified_risk_sentence or background_risk_sentence):
-        sentences.append(risk_sentence)
-
-    final_text = " ".join(sentences).strip()
+    final_text = " ".join(safe_sentences).strip()
     words = final_text.split()
-    if len(words) > 60:
-        final_text = " ".join(words[:60]).rstrip(" .;:") + "."
-
-    if len(final_text.split()) < 40 and len(evidence_snippets) > 1 and len(sentences) <= 1:
-        extra = f"Another example is {evidence_snippets[1]}."
-        if len((final_text + " " + extra).split()) <= 60 and extra.lower() not in final_text.lower():
-            final_text = (final_text + " " + extra).strip()
-
-    if not final_text:
-        return "No concise evidence available from candidate narrative or structured fields."
-
+    if len(words) > 80:
+        final_text = " ".join(words[:80]).rstrip(" .;:") + "."
     return final_text[:900]
 
 def write_top_output(
@@ -3594,60 +3450,25 @@ def write_top_output(
     background_positive_scores: np.ndarray | None,
     background_negative_scores: np.ndarray | None,
     top_k: int,
-    diagnostics_by_candidate: dict[int, dict[str, float]] | None = None,
-    debug_top_k: int | None = None,
-) -> list[dict[str, Any]]:
-    ranked_rows: list[dict[str, Any]] = []
-    row_limit = max(top_k, int(debug_top_k or top_k))
+) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"], extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"])
         writer.writeheader()
-        for rank, cand_idx in enumerate(ranked[:row_limit], 1):
-            row: dict[str, Any] = {
-                "candidate_id": candidates[cand_idx].candidate_id,
-                "rank": rank,
-                "score": f"{float(final_scores[cand_idx]):.8f}",
-                "reasoning": make_reasoning(
-                    candidates[cand_idx],
-                    chunks,
-                    adjusted_scores[cand_idx],
-                    None if background_positive_scores is None else background_positive_scores[cand_idx],
-                    None if background_negative_scores is None else background_negative_scores[cand_idx],
-                ),
-                "Rank": rank,
-                "Candidate ID": candidates[cand_idx].candidate_id,
-                "Final Score": float(final_scores[cand_idx]),
-            }
-            if diagnostics_by_candidate and cand_idx in diagnostics_by_candidate:
-                row.update(diagnostics_by_candidate[cand_idx])
-            ranked_rows.append(row)
-            if rank <= top_k:
-                writer.writerow(row)
-    return ranked_rows
-
-
-def write_score_distribution(path: Path, ranked_rows: list[dict[str, Any]]) -> None:
-    fieldnames = [
-        "Rank",
-        "Candidate ID",
-        "Final Score",
-        "Semantic Score",
-        "CrossEncoder Score",
-        "BiEncoder Score",
-        "BM25 Score",
-        "Adaptive CE Weight",
-        "Adaptive BE Weight",
-        "Adaptive BM25 Weight",
-        "Coverage",
-        "Evidence Density",
-        "BVS",
-        "Negative Penalty",
-    ]
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in ranked_rows[:100]:
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
+        for rank, cand_idx in enumerate(ranked[:top_k], 1):
+            writer.writerow(
+                {
+                    "candidate_id": candidates[cand_idx].candidate_id,
+                    "rank": rank,
+                    "score": f"{float(final_scores[cand_idx]):.8f}",
+                    "reasoning": make_reasoning(
+                        candidates[cand_idx],
+                        chunks,
+                        adjusted_scores[cand_idx],
+                        None if background_positive_scores is None else background_positive_scores[cand_idx],
+                        None if background_negative_scores is None else background_negative_scores[cand_idx],
+                    ),
+                }
+            )
 
 def write_scores_output(
     path: Path,
@@ -3956,16 +3777,6 @@ def run(args: argparse.Namespace) -> int:
     background_negative_full = np.zeros_like(adjusted_scores, dtype=np.float32)
 
     final_scores = np.full(len(candidates), -np.inf, dtype=np.float32)
-    semantic_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    cross_encoder_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    biencoder_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    bm25_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    adaptive_ce_weights = np.full(len(candidates), np.nan, dtype=np.float32)
-    adaptive_be_weights = np.full(len(candidates), np.nan, dtype=np.float32)
-    adaptive_bm25_weights = np.full(len(candidates), np.nan, dtype=np.float32)
-    coverage_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    evidence_density_scores = np.full(len(candidates), np.nan, dtype=np.float32)
-    negative_penalty_scores = np.full(len(candidates), np.nan, dtype=np.float32)
     coverage_bonus_values: list[float] = []
     evidence_bonus_values: list[float] = []
     negative_conf_values: list[float] = []
@@ -4078,16 +3889,6 @@ def run(args: argparse.Namespace) -> int:
         # Narrative negative confidence acts as a calibrated risk penalty.
         narrative_penalty = negative_confidence_penalty(negative_conf)
         final_scores[cand_idx] = final_raw * narrative_penalty
-        semantic_component_scores[cand_idx] = float(semantic_core)
-        cross_encoder_component_scores[cand_idx] = float(ce_tech)
-        biencoder_component_scores[cand_idx] = float(bi_proxy)
-        bm25_component_scores[cand_idx] = float(bm25_proxy)
-        adaptive_ce_weights[cand_idx] = float(fusion_weights[0])
-        adaptive_be_weights[cand_idx] = float(fusion_weights[1])
-        adaptive_bm25_weights[cand_idx] = float(fusion_weights[2])
-        coverage_scores[cand_idx] = float(coverage_quality)
-        evidence_density_scores[cand_idx] = float(evidence_quality)
-        negative_penalty_scores[cand_idx] = float(narrative_penalty)
 
         coverage_bonus_values.append(coverage_bonus)
         evidence_bonus_values.append(evidence_bonus)
@@ -4127,24 +3928,7 @@ def run(args: argparse.Namespace) -> int:
             "Increase --shortlist-size or use --allow-fewer-than-top-k for smoke tests."
         )
     # -----------------------------------
-    diagnostic_rank_limit = min(100, len(ranked))
-    diagnostics_by_candidate = {
-        cand_idx: {
-            "Semantic Score": float(semantic_component_scores[cand_idx]),
-            "CrossEncoder Score": float(cross_encoder_component_scores[cand_idx]),
-            "BiEncoder Score": float(biencoder_component_scores[cand_idx]),
-            "BM25 Score": float(bm25_component_scores[cand_idx]),
-            "Adaptive CE Weight": float(adaptive_ce_weights[cand_idx]),
-            "Adaptive BE Weight": float(adaptive_be_weights[cand_idx]),
-            "Adaptive BM25 Weight": float(adaptive_bm25_weights[cand_idx]),
-            "Coverage": float(coverage_scores[cand_idx]),
-            "Evidence Density": float(evidence_density_scores[cand_idx]),
-            "BVS": float(bvs_scores[cand_idx]),
-            "Negative Penalty": float(negative_penalty_scores[cand_idx]),
-        }
-        for cand_idx in ranked[:diagnostic_rank_limit]
-    }
-    ranked_rows = write_top_output(
+    write_top_output(
         output_path,
         ranked,
         final_scores,
@@ -4154,10 +3938,7 @@ def run(args: argparse.Namespace) -> int:
         background_positive_full,
         background_negative_full,
         min(args.top_k, len(ranked)),
-        diagnostics_by_candidate,
-        diagnostic_rank_limit,
     )
-    write_score_distribution(output_path.parent / "score_distribution_top100.csv", ranked_rows)
 
     if args.scores_output:
         write_scores_output(
@@ -4198,10 +3979,28 @@ def run(args: argparse.Namespace) -> int:
             "cross_encoder_model": args.cross_encoder_model,
             "model_cache_dir": str(model_cache_dir),
             "jd_embeddings_cache": str(jd_embeddings_cache),
+            "stage_weights": {
+                "bm25_fast_triage": "0.64 * minmax(BM25_family_semantic_raw) + 0.36 * BVS",
+                "bm25_vector_hybrid": "0.35 * focused_BM25 + 0.65 * focused_vector",
+                "first_pass": "0.64 * semantic_final_norm + 0.36 * BVS",
+            },
+            "cross_encoder_evidence": {
+                "positive": "0.60 * s1 + 0.40 * mean(available supporting chunks s2/s3); support term is 0.0 if no supporting chunk exists",
+                "negative": "0.70 * max(top2_negative) + 0.30 * mean(top2_negative)",
+            },
+            "negative_risk": {
+                "background": "0.60 * weighted_mean + 0.40 * weighted_consensus",
+                "combined_ce_background": "0.70 * verified_negative_risk + 0.30 * background_risk",
+                "ce_risk_multiplier": "math.exp(-max(0.0, combined_negative_risk) * 2.4)",
+                "narrative_penalty": "negative_confidence_penalty(negative_confidence)",
+            },
             "final_weights": {
-                "first_pass_hybrid": "Behavior-aware: 0.64 * semantic_norm + 0.36 * bvs_score",
-                "cross_encoder_final": "Adaptive reliability-weighted fusion over CE, semantic_boost, and bvs_base; CE remains the dominant signal after smart calibration",
-                "negative_penalty": "Calibrated narrative risk penalty: negative_confidence_penalty(negative_conf)",
+                "adaptive_fusion_base": {"cross_encoder_adjusted": 0.60, "background_support_pow_0.92": 0.30, "bm25_proxy": 0.10},
+                "adaptive_fusion_calibration": "0.92 * base_weights + 0.08 * reliability_weights",
+                "semantic_core_tail_stretch": "stretch_upper_tail(threshold=0.75, gamma=0.92)",
+                "bvs_bonus": "0.17 * (BVS - 0.5)",
+                "final_raw": "0.72 * semantic_core + bvs_bonus + coverage_bonus + evidence_bonus",
+                "final_score": "final_raw * negative_confidence_penalty(negative_confidence)",
             },
             "overlap_control": "connected-components near-duplicate suppression using chunk similarity thresholds",
             "vector_backend": vector_backend,

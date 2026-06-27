@@ -4,7 +4,7 @@ This repository contains our submission for the **Redrob Intelligent Candidate D
 
 The project implements a **production-inspired, multi-stage hybrid candidate ranking pipeline** that progressively narrows the candidate search space while increasing the sophistication of evaluation at each stage. It combines structured recruiter signals, hybrid information retrieval, semantic reranking, and explainable score fusion to rank candidates for a given job description under the hackathon's CPU-only runtime constraints.
 
-Rather than relying on a single ranking signal, the system combines **structured eligibility**, **lexical retrieval**, **semantic retrieval**, **pairwise neural verification**, and **behavior-aware scoring** into one interpretable ranking framework. The latest version also adds agreement-aware Cross-Encoder calibration, JD-weighted evidence scoring, and a small adaptive semantic fusion layer that stays close to the original 0.55 / 0.25 / 0.20 blend while remaining bounded and stable.
+Rather than relying on a single ranking signal, the system combines **structured eligibility**, **internal-consistency validation**, **lexical retrieval**, **semantic retrieval**, **pairwise neural verification**, and **behavior-aware scoring** into one interpretable ranking framework. The current implementation uses agreement-aware Cross-Encoder calibration, complementary Bi-Encoder support, background negative-risk checks, JD-weighted coverage/evidence scoring, and a bounded adaptive fusion layer centered on the current `0.60 / 0.30 / 0.10` CE / BiEncoder / BM25 blend.
 
 ---
 
@@ -92,7 +92,7 @@ Validate the generated submission:
 python validate_submission.py Real_RR.csv
 ```
 
-If you want to inspect intermediate outputs, enable the optional report flags in `rank_candidates.py` and the pipeline will write additional CSVs alongside the final submission.
+The production ranking run writes only the final submission CSV.
 
 ---
 
@@ -102,40 +102,49 @@ The ranking pipeline reduces the candidate search space stage by stage.
 
 ```text
 L0 Structured Triage
-        │
-        ▼
+        |
+        v
+Internal Consistency / Honeypot Check
+        |
+        v
 Behavior Validation Score (BVS)
-        │
-        ▼
+        |
+        v
 Candidate Enrichment
-        │
-        ▼
+        |
+        v
 Hybrid Retrieval
- ├── BM25 Lexical Retrieval
- └── Dense Vector Retrieval (Bi-Encoder)
-        │
-        ▼
+ |-- BM25 Lexical Retrieval
+ `-- Dense Vector Retrieval (Bi-Encoder)
+        |
+        v
 Family-aware Candidate Recall
-        │
-        ▼
+        |
+        v
 Adaptive Cross-Encoder Chunk Selection
-        │
-        ▼
+        |
+        v
 Cross-Encoder Pairwise Reranking
-        │
-        ▼
+        |
+        v
+Complementary Bi-Encoder Support
+        |
+        v
+Background Negative Risk
+        |
+        v
 Quality-based Coverage
-        │
-        ▼
+        |
+        v
 Evidence Density
-        │
-        ▼
-Negative Confidence
-        │
-        ▼
+        |
+        v
+Narrative Negative Confidence
+        |
+        v
 Final Score Fusion
-        │
-        ▼
+        |
+        v
 Ranked Candidate List
 ```
 
@@ -147,18 +156,19 @@ Ranked Candidate List
 
 This stage uses only explicit candidate metadata.
 
-It removes only clear eligibility mismatches such as:
+It removes only clear eligibility or data-validity mismatches such as:
 
-* notice period
-* recruiter activity
-* relocation preference
-* location compatibility
-* profile completeness
-* structured hiring attributes
+* outside-India logistics when relocation is explicitly refused
+* impossible notice periods above 180 days
+* truly stale and unresponsive profiles
+* unusable profiles with no meaningful profile, history, or skills
+* internally inconsistent employment, education, salary, or current-role data detected by the honeypot check
 
 No semantic matching is used here.
 
-The goal is to shrink the search space while keeping false negatives low.
+The goal is to keep L0 as a low-false-negative eligibility layer. Preferences such as experience band, notice length, product-company background, retrieval depth, open-source visibility, and recruiter-domain experience are handled by BVS rather than used as hard gates.
+
+The internal-consistency check is implemented by `compute_honeypot_score(candidate)`. Hard drops include impossible date ordering, duplicate employment records, multiple current roles, current roles with end dates, non-current roles without end dates, education year reversals, invalid salary ranges, and large duration mismatches. Non-hard consistency concerns become a small BVS penalty through `honeypot_score`.
 
 ---
 
@@ -201,7 +211,9 @@ $$
 \lambda = 0.34
 $$
 
-The score combines structured hiring signals including recruiter responsiveness, assessment performance, interview completion, notice period, experience alignment, profile quality, verification status, market engagement, and recruiter activity.
+The score combines structured hiring signals including recruiter responsiveness, assessment performance, interview completion, notice period, experience alignment, profile quality, verification status, market engagement, recruiter activity, product/startup exposure, and internal-consistency penalties.
+
+BVS is not used as an eligibility gate after L0. All candidates that pass hard L0 checks remain available for semantic retrieval; BVS only influences ranking as a centered refinement signal.
 
 ---
 
@@ -259,6 +271,8 @@ Rather than selecting only globally highest-scoring retrieval results, candidate
 
 This prevents a single topic from dominating retrieval while encouraging broad semantic coverage across the complete job description.
 
+The default BM25 pre-shortlist is `1000` candidates via `--pre-shortlist-size`. The Bi-Encoder stage then selects the default `150` candidate shortlist for Cross-Encoder reranking via `--shortlist-size`.
+
 ---
 
 ## Stage 6 — Adaptive Cross-Encoder Reranking
@@ -268,13 +282,32 @@ The strongest candidate evidence is first selected through adaptive chunk select
 Instead of evaluating every available candidate passage, the pipeline retains only:
 
 * up to **6** high-quality positive evidence chunks
-* up to **2** informative negative evidence chunks
+* up to **3** informative negative evidence chunks
 
 This substantially reduces Cross-Encoder computation while preserving semantic recall.
 
 Each selected candidate chunk is then jointly encoded with its corresponding JD chunk using a Cross-Encoder, producing significantly more accurate pairwise relevance estimates than independent embeddings.
 
-The Cross-Encoder score is softly calibrated using agreement across the three retrieval signals.
+Verified positive Cross-Encoder evidence is aggregated from the strongest positive chunks without double-counting the strongest chunk:
+
+$$
+CE_{positive}=0.60\times s_1 + 0.40\times \frac{s_2+s_3}{2}
+$$
+
+where:
+
+* $s_1$ is the strongest verified positive CE chunk
+* $s_2$ and $s_3$ are the next supporting positive chunks
+* if only one supporting chunk exists, that one chunk is used as the support term
+* if no supporting chunk exists, the support term is `0.0`
+
+Verified negative CE risk still uses the highest two negative risk chunks:
+
+$$
+verified\_negative\_risk = 0.70\times \max(top2_{negative}) + 0.30\times mean(top2_{negative})
+$$
+
+The positive Cross-Encoder contribution is then softly calibrated using agreement across the three retrieval signals.
 
 Let:
 
@@ -300,10 +333,16 @@ $$
 m = 0.90 + 0.10a
 $$
 
-The calibrated Cross-Encoder contribution is then adjusted with the negative evidence penalty:
+The Cross-Encoder risk term combines verified CE negative evidence with background negative Bi-Encoder risk:
 
 $$
-ce_{adj} = ce \times m \times e^{-2.4\max(0,cross\_neg)}
+combined\_negative\_risk = 0.70\times verified\_negative\_risk + 0.30\times background\_risk
+$$
+
+The calibrated Cross-Encoder contribution is then adjusted with that combined risk:
+
+$$
+ce_{adj} = ce \times m \times e^{-2.4\max(0,combined\_negative\_risk)}
 $$
 
 The semantic fusion stage then applies a small consensus-aware calibration around the base retrieval blend.
@@ -311,19 +350,19 @@ The semantic fusion stage then applies a small consensus-aware calibration aroun
 First define:
 
 $$
-s_p = \min(1,\max(0,semantic\_boost))^{0.92}
+s_p = \min(1,\max(0,background\_support))^{0.92}
 $$
 
 $$
-w_1^{base}=0.55
+w_1^{base}=0.60
 $$
 
 $$
-w_2^{base}=0.25
+w_2^{base}=0.30
 $$
 
 $$
-w_3^{base}=0.20
+w_3^{base}=0.10
 $$
 
 Let:
@@ -376,6 +415,24 @@ and:
 
 $$
 semantic_{core}=f(semantic_{core})
+$$
+
+Complementary Bi-Encoder support is computed only from positive JD chunks not already selected for CE. The number of complementary chunks adapts to verified CE confidence:
+
+* strong CE confidence: up to 2 chunks
+* medium CE confidence: up to 3 chunks
+* weak CE confidence: up to 4 chunks
+
+If verified CE chunks already cover most core JD families, the complementary count is reduced by one. The selected support is aggregated with diminishing returns:
+
+$$
+background\_support = 1 - e^{-1.7\times weighted\_support}
+$$
+
+Background negative risk is computed from non-CE negative chunks above the Bi-Encoder threshold. It combines mean risk and consensus over strong matches:
+
+$$
+background\_risk = 0.60\times weighted\_mean + 0.40\times weighted\_consensus
 $$
 
 ---
@@ -440,9 +497,9 @@ This keeps the score focused on the strongest evidence while still respecting JD
 
 ---
 
-## Stage 9 — Negative Confidence
+## Stage 9 — Narrative Negative Confidence
 
-Potential recruiter risks including wrapper-only experience, research-only backgrounds, or weak production evidence are summarized into a calibrated Negative Confidence score.
+Potential recruiter risks including wrapper-only experience, research-only backgrounds, framework-demo profiles, or domain mismatch are summarized from candidate narrative text into a calibrated Negative Confidence score.
 
 The negative families are aggregated into a single confidence value:
 
@@ -460,7 +517,9 @@ e^{-2.40(n-0.18)} & n > 0.18
 \end{cases}
 $$
 
-Rather than applying hard penalties, multiple negative signals are aggregated into a confidence estimate. That keeps the system explainable and reduces false penalties from isolated keywords.
+Rather than applying hard penalties, multiple narrative signals are aggregated into a confidence estimate and offset by positive production/retrieval/evaluation evidence. That keeps the system explainable and reduces false penalties from isolated keywords.
+
+This narrative penalty is separate from the CE/background negative-risk adjustment described in Stage 6.
 
 ---
 
@@ -500,11 +559,7 @@ The main submission file is:
 
 * `Real_RR.csv`
 
-The pipeline can also write:
-
-* `diagnostic_top20.csv` for manual inspection
-* optional stage-specific report CSVs when enabled via CLI flags
-* cached model/embedding artifacts under `models/` and `cache/`
+The ranking output is intentionally limited to `Real_RR.csv`. Model and embedding artifacts may be reused from `models/` and `cache/`, but no additional CSV diagnostics are written during a production run.
 
 The explanation text in the final output is generated from candidate narrative text, structured BVS signals, and the selected evidence passages. Internal retrieval tags are used only for retrieval and do not need to appear in the final explanation.
 
