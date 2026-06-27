@@ -74,7 +74,7 @@ CHUNK_FAMILIES: dict[str, str] = {
 POSITIVE_FAMILY_ORDER = ("RETRIEVAL", "EVALUATION", "SYSTEMS", "PRODUCT", "DOMAIN", "CULTURE", "ADVANCED")
 POSITIVE_FAMILY_TARGET = 10
 CROSS_ENCODER_MAX_POSITIVE_CHUNKS = 6
-CROSS_ENCODER_MAX_NEGATIVE_CHUNKS = 2
+CROSS_ENCODER_MAX_NEGATIVE_CHUNKS = 3
 
 BONUS_CHUNK_WEIGHT_MULTIPLIERS: dict[str, float] = {
     "C05": 1.08,  # shipped systems
@@ -119,6 +119,9 @@ COVERAGE_SUPPORT_THRESHOLD = CROSS_ENCODER_POSITIVE_FLOOR
 EVIDENCE_DENSITY_THRESHOLD = 0.10
 NEGATIVE_CONFIDENCE_RELEASE = 0.18
 NEGATIVE_CONFIDENCE_PENALTY_SCALE = 2.40
+BACKGROUND_NEGATIVE_BI_THRESHOLD = 0.28
+COMPLEMENTARY_BI_THRESHOLD = 0.18
+COMPLEMENTARY_BI_MAX_CHUNKS = 4
 
 WELCOME_CITIES = (
     "pune",
@@ -1534,6 +1537,7 @@ def evaluate_l0_hard_drop_reasons(
     willing_relocate = bool(signals.get("willing_to_relocate"))
     open_to_work = bool(signals.get("open_to_work_flag"))
     last_active = parse_date(signals.get("last_active_date"))
+    has_recruiter_response_rate = signals.get("recruiter_response_rate") is not None
     recruiter_response_rate = as_float(signals.get("recruiter_response_rate"), 0.0)
     notice_days = as_int(signals.get("notice_period_days"), 0)
 
@@ -1541,17 +1545,215 @@ def evaluate_l0_hard_drop_reasons(
     if country and "india" not in country and not willing_relocate:
         reasons.append("outside_india_and_no_relocation")
 
-    # Extremely long notice periods are effectively non-starters.
+    # Extremely long notice periods are treated as impossible hiring logistics.
     if notice_days > 180:
-        reasons.append("extreme_notice_period")
+        reasons.append(f"notice_period_unavailable={notice_days}d")
 
     # Truly stale + unresponsive + not open to work profiles are dropped.
     if last_active is not None:
         days_inactive = max(0, (as_of_date - last_active).days)
-        if days_inactive >= 540 and recruiter_response_rate <= 0.05 and not open_to_work:
+        if days_inactive >= 540 and has_recruiter_response_rate and recruiter_response_rate <= 0.05 and not open_to_work:
             reasons.append("stale_and_unresponsive")
 
     return reasons
+
+
+def compute_honeypot_score(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Score only internally inconsistent structured candidate data."""
+    profile = candidate.get("profile") or {}
+    history = candidate.get("career_history") or []
+    education = candidate.get("education") or []
+    skills = candidate.get("skills") or []
+    signals = candidate.get("redrob_signals") or {}
+    reasons: list[str] = []
+    hard_drop = False
+    penalty = 0.0
+
+    def add_hard(reason: str) -> None:
+        nonlocal hard_drop, penalty
+        hard_drop = True
+        penalty = max(penalty, 1.0)
+        reasons.append(reason)
+
+    def add_penalty(amount: float, reason: str) -> None:
+        nonlocal penalty
+        penalty += amount
+        reasons.append(reason)
+
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def calendar_months(start: date, end: date) -> int:
+        months = (end.year - start.year) * 12 + (end.month - start.month)
+        if end.day >= start.day:
+            months += 1
+        return max(0, months)
+
+    def add_months(start: date, months: int) -> date:
+        month_index = (start.month - 1) + max(0, months)
+        year = start.year + month_index // 12
+        month = (month_index % 12) + 1
+        day = min(start.day, 28)
+        return date(year, month, day)
+
+    current_roles: list[dict[str, Any]] = []
+    role_keys: set[tuple[Any, ...]] = set()
+    full_time_intervals: list[tuple[date, date]] = []
+    earliest_start: date | None = None
+    latest_current_role: dict[str, Any] | None = None
+
+    for role in history if isinstance(history, list) else []:
+        if not isinstance(role, dict):
+            continue
+        start = parse_date(role.get("start_date"))
+        end = parse_date(role.get("end_date"))
+        is_current = bool(role.get("is_current"))
+        duration_months = as_int(role.get("duration_months"), -1)
+        key = (
+            norm(role.get("company")),
+            norm(role.get("title")),
+            role.get("start_date"),
+            role.get("end_date"),
+            duration_months,
+            is_current,
+        )
+        if key in role_keys:
+            add_hard("duplicate_employment_record")
+        role_keys.add(key)
+
+        if is_current:
+            current_roles.append(role)
+            if latest_current_role is None:
+                latest_current_role = role
+            elif start and (parse_date(latest_current_role.get("start_date")) or date.min) < start:
+                latest_current_role = role
+            if end is not None:
+                add_hard("current_role_has_end_date")
+        elif end is None:
+            add_hard("non_current_role_missing_end_date")
+
+        if start and end and end < start:
+            add_hard("employment_end_before_start")
+
+        if start:
+            earliest_start = start if earliest_start is None else min(earliest_start, start)
+            interval_end = end
+            if interval_end is None and is_current and duration_months > 0:
+                interval_end = add_months(start, duration_months)
+            if interval_end >= start:
+                full_time_intervals.append((start, interval_end))
+            if end and duration_months >= 0:
+                actual_months = calendar_months(start, end)
+                if abs(duration_months - actual_months) > 6:
+                    add_hard(f"duration_mismatch={duration_months}mo_actual={actual_months}mo")
+
+    if len(current_roles) > 1:
+        add_hard("multiple_current_roles")
+
+    for edu in education if isinstance(education, list) else []:
+        if not isinstance(edu, dict):
+            continue
+        start_year = as_int(edu.get("start_year"), 0)
+        end_year = as_int(edu.get("end_year"), 0)
+        if start_year > 0 and end_year > 0 and end_year < start_year:
+            add_hard("education_end_before_start")
+
+    salary_range = signals.get("expected_salary_range_inr_lpa") or {}
+    if isinstance(salary_range, dict):
+        salary_min = as_float(salary_range.get("min"), 0.0)
+        salary_max = as_float(salary_range.get("max"), 0.0)
+        if salary_min > 0.0 and salary_max > 0.0 and salary_min > salary_max:
+            add_hard("salary_min_greater_than_max")
+
+    dated_intervals = sorted(full_time_intervals, key=lambda item: (item[0], item[1]))
+    if dated_intervals:
+        career_start = min(start for start, _ in dated_intervals)
+        career_end = max(end for _, end in dated_intervals)
+        career_months = calendar_months(career_start, career_end)
+        profile_yoe_months = int(round(as_float(profile.get("years_of_experience"), 0.0) * 12.0))
+        if profile_yoe_months > 0 and career_months - profile_yoe_months > 48:
+            add_penalty(0.20, f"career_duration_exceeds_profile_yoe={career_months}mo_vs_{profile_yoe_months}mo")
+
+    expert_skill_months: list[int] = []
+    skill_duration_by_name: dict[str, int] = {}
+    for skill in skills if isinstance(skills, list) else []:
+        if not isinstance(skill, dict):
+            continue
+        name = norm(skill.get("name"))
+        months = as_int(skill.get("duration_months"), 0)
+        if name:
+            skill_duration_by_name[name] = max(skill_duration_by_name.get(name, 0), months)
+        proficiency = norm(skill.get("proficiency"))
+        if proficiency in {"expert", "advanced"}:
+            expert_skill_months.append(months)
+            if 0 <= months < 6:
+                add_penalty(0.12, f"advanced_skill_too_short={name or 'unknown'}:{months}mo")
+
+    if len(expert_skill_months) >= 5:
+        avg_expert_months = sum(expert_skill_months) / float(len(expert_skill_months))
+        if avg_expert_months < 12.0:
+            add_penalty(0.18, f"many_expert_skills_low_duration_avg={avg_expert_months:.1f}mo")
+
+    overlap_pairs = 0
+    for i, (start_a, end_a) in enumerate(dated_intervals):
+        for start_b, end_b in dated_intervals[i + 1:]:
+            if min(end_a, end_b) >= max(start_a, start_b):
+                overlap_months = calendar_months(max(start_a, start_b), min(end_a, end_b))
+                if overlap_months >= 3:
+                    overlap_pairs += 1
+    if overlap_pairs >= 2:
+        add_penalty(0.18, f"excessive_overlapping_roles={overlap_pairs}")
+
+    if latest_current_role:
+        profile_title = norm(profile.get("current_title"))
+        profile_company = norm(profile.get("current_company"))
+        role_title = norm(latest_current_role.get("title"))
+        role_company = norm(latest_current_role.get("company"))
+        if profile_title and role_title and profile_title != role_title:
+            add_penalty(0.10, "current_title_mismatch_latest_role")
+        if profile_company and role_company and profile_company != role_company:
+            add_penalty(0.10, "current_company_mismatch_latest_role")
+
+    education_end_years = [
+        as_int(edu.get("end_year"), 0)
+        for edu in education if isinstance(edu, dict) and as_int(edu.get("end_year"), 0) > 0
+    ] if isinstance(education, list) else []
+    if earliest_start and education_end_years:
+        earliest_education_end = min(education_end_years)
+        if earliest_start.year < earliest_education_end - 2:
+            add_penalty(0.12, f"career_before_education_completion={earliest_start.year}_vs_{earliest_education_end}")
+
+    assessments = signals.get("skill_assessment_scores") or {}
+    if isinstance(assessments, dict):
+        for skill_name, raw_score in assessments.items():
+            score = as_float(raw_score, 0.0)
+            skill_months = skill_duration_by_name.get(norm(skill_name), 0)
+            if score > 90.0 and 0 <= skill_months < 3:
+                add_penalty(0.12, f"high_assessment_low_duration={norm(skill_name) or 'unknown'}:{score:.1f}:{skill_months}mo")
+
+    profile_text_len = len(" ".join([
+        str(profile.get("headline") or ""),
+        str(profile.get("summary") or ""),
+    ]).split())
+    recruiter_signal_count = 0
+    if as_int(signals.get("profile_views_received_30d"), 0) > 250:
+        recruiter_signal_count += 1
+    if as_int(signals.get("search_appearance_30d"), 0) > 500:
+        recruiter_signal_count += 1
+    if as_int(signals.get("saved_by_recruiters_30d"), 0) > 15:
+        recruiter_signal_count += 1
+    if as_float(signals.get("recruiter_response_rate"), 0.0) > 0.95:
+        recruiter_signal_count += 1
+    if as_int(signals.get("connection_count"), 0) > 3000:
+        recruiter_signal_count += 1
+    if recruiter_signal_count >= 3 and profile_text_len < 20 and not history:
+        add_penalty(0.16, "extreme_recruiter_signals_empty_profile")
+
+    return {
+        "honeypot_score": clamp01(penalty),
+        "hard_drop": bool(hard_drop),
+        "reasons": reasons,
+    }
 
 
 def apply_l0_triage(
@@ -1582,6 +1784,8 @@ def apply_l0_triage(
         yoe = as_float(profile.get("years_of_experience"), 0.0)
         last_active = parse_date(signals.get("last_active_date"))
         signup_date = parse_date(signals.get("signup_date"))
+        has_recruiter_response_rate = signals.get("recruiter_response_rate") is not None
+        has_avg_response_hours = signals.get("avg_response_time_hours") is not None
         recruiter_response_rate = as_float(signals.get("recruiter_response_rate"), 0.0)
         avg_response_hours = as_float(signals.get("avg_response_time_hours"), 0.0)
         notice_days = as_int(signals.get("notice_period_days"), 0)
@@ -1594,18 +1798,25 @@ def apply_l0_triage(
             discarded.append({"candidate_id": cand_id, "reason": "; ".join(hard_drop_reasons)})
             continue
 
+        honeypot = compute_honeypot_score(candidate)
+        honeypot_reasons = [str(reason) for reason in (honeypot.get("reasons") or [])]
+        honeypot_score = clamp01(as_float(honeypot.get("honeypot_score"), 0.0))
+        if bool(honeypot.get("hard_drop")):
+            discarded.append({"candidate_id": cand_id, "reason": "honeypot_hard_drop: " + "; ".join(honeypot_reasons)})
+            continue
+
         raw_bvs = 0.40
         strengths: list[str] = []
         penalties: list[str] = []
 
-        # Tier constants for a symmetric, readable BVS framework.
-        TIER3_EXCEPTIONAL_GREEN = 0.18   # strongest positive signals
-        TIER3_STRONG_GREEN = 0.15        # very strong positives
-        TIER2_GREEN = 0.08               # solid positives
-        TIER1_GREEN = 0.03               # mild positives
-        TIER2_MAJOR_WARNING = -0.18      # major warnings
-        TIER1_FATAL_RED = -0.35          # severe soft penalty, not hard drop
-        TIER1_SMALL_WARNING = -0.08      # mild-to-moderate warnings
+        # Tier constants keep BVS as preference modeling, not eligibility.
+        TIER3_EXCEPTIONAL_GREEN = 0.10   # strongest positive signals
+        TIER3_STRONG_GREEN = 0.08        # very strong positives
+        TIER2_GREEN = 0.05               # solid positives
+        TIER1_GREEN = 0.02               # mild positives
+        TIER2_MAJOR_WARNING = -0.08      # major warnings
+        TIER1_FATAL_RED = -0.12          # severe soft penalty, not hard drop
+        TIER1_SMALL_WARNING = -0.03      # mild-to-moderate warnings
 
         def add_strength(delta: float, reason: str) -> None:
             nonlocal raw_bvs
@@ -1616,6 +1827,10 @@ def apply_l0_triage(
             nonlocal raw_bvs
             raw_bvs += delta
             penalties.append(reason)
+
+        if honeypot_score > 0.0:
+            add_penalty(-0.20 * honeypot_score, f"honeypot_score={honeypot_score:.2f}")
+            penalties.extend(f"honeypot_{reason}" for reason in honeypot_reasons[:4])
 
         # Geography / relocation fit
         if "india" not in country:
@@ -1636,10 +1851,10 @@ def apply_l0_triage(
             add_strength(TIER2_GREEN, f"acceptable_yoe={yoe:.1f}")
         elif 4.0 <= yoe < 5.0 or 9.0 < yoe <= 11.0:
             add_strength(TIER1_GREEN, f"near_band_yoe={yoe:.1f}")
-        elif yoe < 3.0 or yoe > 12.0:
-            add_penalty(TIER1_FATAL_RED, f"outside_jd_band={yoe:.1f}")
-        else:
+        elif yoe < 3.0 or yoe > 14.0:
             add_penalty(TIER2_MAJOR_WARNING, f"outside_jd_band={yoe:.1f}")
+        else:
+            add_penalty(TIER1_SMALL_WARNING, f"outside_jd_band={yoe:.1f}")
 
         # Availability / activity
         if signals.get("open_to_work_flag"):
@@ -1665,18 +1880,18 @@ def apply_l0_triage(
             else:
                 add_penalty(TIER2_MAJOR_WARNING, "stale_activity")
 
-        if recruiter_response_rate >= 0.80:
+        if has_recruiter_response_rate and recruiter_response_rate >= 0.80:
             add_strength(TIER3_EXCEPTIONAL_GREEN, f"recruiter_response_rate={recruiter_response_rate:.2f}")
-        elif recruiter_response_rate >= 0.60:
+        elif has_recruiter_response_rate and recruiter_response_rate >= 0.60:
             add_strength(TIER2_GREEN, f"recruiter_response_rate={recruiter_response_rate:.2f}")
-        elif recruiter_response_rate < 0.20:
+        elif has_recruiter_response_rate and recruiter_response_rate < 0.20:
             add_penalty(TIER2_MAJOR_WARNING, f"low_recruiter_response_rate={recruiter_response_rate:.2f}")
 
-        if avg_response_hours <= 24:
+        if has_avg_response_hours and avg_response_hours <= 24:
             add_strength(TIER3_EXCEPTIONAL_GREEN, f"avg_response_time={avg_response_hours:.1f}h")
-        elif avg_response_hours <= 72:
+        elif has_avg_response_hours and avg_response_hours <= 72:
             add_strength(TIER2_GREEN, f"avg_response_time={avg_response_hours:.1f}h")
-        elif avg_response_hours > 168:
+        elif has_avg_response_hours and avg_response_hours > 168:
             add_penalty(TIER2_MAJOR_WARNING, f"slow_response={avg_response_hours:.1f}h")
 
         if notice_days <= 15 and notice_days > 0:
@@ -1685,9 +1900,9 @@ def apply_l0_triage(
             add_strength(TIER1_GREEN, f"notice_period={notice_days}d")
         elif 30 < notice_days <= 60:
             add_penalty(TIER1_SMALL_WARNING, f"notice_period={notice_days}d")
-        elif 60 < notice_days <= 90:
-            add_penalty(TIER2_MAJOR_WARNING, f"notice_period={notice_days}d")
-        elif notice_days > 90:
+        elif 60 < notice_days <= 120:
+            add_penalty(TIER1_SMALL_WARNING, f"notice_period={notice_days}d")
+        elif notice_days > 120:
             add_penalty(TIER2_MAJOR_WARNING, f"notice_period={notice_days}d")
 
         if as_int(signals.get("applications_submitted_30d"), 0) > 3:
@@ -1741,6 +1956,7 @@ def apply_l0_triage(
             if any(term in skill_l for term in RELEVANT_SKILL_TERMS):
                 relevant_assessment_scores.append(score)
 
+        has_assessment_scores = bool(relevant_assessment_scores or fallback_assessment_scores)
         if relevant_assessment_scores:
             avg_relevant = sum(relevant_assessment_scores) / len(relevant_assessment_scores)
         elif fallback_assessment_scores:
@@ -1748,17 +1964,17 @@ def apply_l0_triage(
         else:
             avg_relevant = 0.35
 
-        if avg_relevant >= 0.85:
+        if has_assessment_scores and avg_relevant >= 0.85:
             add_strength(TIER3_EXCEPTIONAL_GREEN, f"high_assessment_avg={avg_relevant:.2f}")
-        elif avg_relevant >= 0.65:
+        elif has_assessment_scores and avg_relevant >= 0.65:
             add_strength(TIER2_GREEN, f"assessment_avg={avg_relevant:.2f}")
-        elif avg_relevant < 0.45:
-            add_penalty(TIER1_FATAL_RED, f"low_assessment_avg={avg_relevant:.2f}")
+        elif has_assessment_scores and avg_relevant < 0.45:
+            add_penalty(TIER2_MAJOR_WARNING, f"low_assessment_avg={avg_relevant:.2f}")
 
         github_score = as_float(signals.get("github_activity_score"), 0.0)
         if github_score > 50:
             add_strength(TIER2_GREEN, f"high_github_activity={github_score:.1f}")
-        elif github_score < 0:
+        elif github_score <= 0.0:
             add_penalty(TIER1_SMALL_WARNING, "missing_github_activity")
 
         role_durations = [
@@ -1800,6 +2016,8 @@ def apply_l0_triage(
             add_strength(TIER1_GREEN, f"product_industry={current_industry}")
             if any(domain in current_industry for domain in ["hr", "recruiting", "marketplace", "talent"]):
                 add_strength(TIER2_GREEN, "hr_marketplace_domain_expert")
+        elif current_industry in ["it services", "consulting"]:
+            add_penalty(TIER1_SMALL_WARNING, f"consulting_service_background={current_industry}")
 
         title_mismatch_terms = ("marketing", "sales", "hr", "recruiter", "people ops", "ops")
         tech_title_terms = ("engineer", "scientist", "ml", "ai", "search", "ranking", "retrieval", "nlp", "data")
@@ -1809,8 +2027,8 @@ def apply_l0_triage(
         if 5.0 <= yoe <= 9.0:
             add_strength(TIER1_GREEN, "experience_in_band")
 
-        # Queue candidate for the second, text-aware pass only if the cheap structured
-        # signals are promising enough.
+        # Queue candidate for the second, text-aware pass. BVS is preference
+        # modeling only; semantic retrieval gets every non-hard-dropped profile.
         staged.append(
             {
                 "candidate": candidate,
@@ -1826,7 +2044,7 @@ def apply_l0_triage(
     if not staged:
         return [], np.zeros((0,), dtype=np.float32), discarded, BVS_MIN_THRESHOLD
 
-    threshold = choose_bvs_threshold(np.asarray([item["raw_bvs"] for item in staged], dtype=np.float32))
+    threshold = BVS_MIN_THRESHOLD
 
     for item in staged:
         cand_id = item["candidate_id"]
@@ -1837,44 +2055,79 @@ def apply_l0_triage(
         history = item["history"]
         skills = item["skills"]
 
-        if raw_bvs < threshold:
-            discarded.append({"candidate_id": cand_id, "reason": f"below_bvs_threshold={raw_bvs:.3f}"})
-            continue
-
         narrative_chunks = build_candidate_text(candidate, as_of_date)
         narrative_text = " ".join(narrative_chunks).lower()
         if narrative_text:
             research_terms = ("research", "academic", "thesis", "publication", "paper", "benchmark", "lab")
-            production_terms = ("production", "deployed", "ship", "shipped", "launched", "users", "customer", "live")
-            wrapper_terms = ("langchain", "openai", "prompt engineering", "wrapper", "tutorial", "demo")
-            retrieval_terms = ("retrieval", "ranking", "search", "embedding", "vector", "recommendation", "ir", "nlp")
+            production_terms = ("production", "deployed", "deploy", "ship", "shipped", "launched", "users", "customer", "customers", "live", "scale", "latency", "throughput")
+            wrapper_terms = ("langchain", "openai", "prompt engineering", "wrapper", "tutorial", "demo", "chatbot", "agent", "agents")
+            retrieval_terms = ("retrieval", "ranking", "ranker", "search", "embedding", "embeddings", "vector", "recommendation", "recommender", "ir", "nlp", "semantic search", "hybrid search")
+            evaluation_terms = ("evaluation", "eval", "ndcg", "mrr", "map", "a/b", "ab test", "offline", "online", "interleaving", "relevance")
             wrong_domain_terms = ("computer vision", "cv", "speech", "robotics")
             systems_terms = ("system", "architecture", "observability", "pipeline", "monitoring", "latency", "throughput")
+            writing_terms = ("async", "asynchronous", "documentation", "docs", "writing", "design doc", "decision memo")
+            recruiter_terms = ("recruiter", "recruiting", "hr tech", "hr-tech", "talent", "ats", "candidate workflow")
+            marketplace_terms = ("marketplace", "matching", "supply", "demand", "two-sided", "ranking marketplace")
+            open_source_terms = ("open source", "github", "maintainer", "contributor", "oss")
+            nice_to_have_terms = ("lora", "qlora", "peft", "learning to rank", "ltr", "inference optimization", "quantization")
 
             if text_has_any(narrative_text, production_terms):
                 raw_bvs += 0.03
                 strengths.append("production_evidence")
-            if text_has_any(narrative_text, research_terms) and not text_has_any(narrative_text, production_terms):
-                raw_bvs -= 0.18
+            if text_has_any(narrative_text, retrieval_terms):
+                raw_bvs += 0.05
+                strengths.append("retrieval_ranking_evidence")
+            if text_has_any(narrative_text, evaluation_terms):
+                raw_bvs += 0.03
+                strengths.append("evaluation_evidence")
+            if text_has_any(narrative_text, systems_terms):
+                raw_bvs += 0.03
+                strengths.append("systems_evidence")
+            if text_has_any(narrative_text, writing_terms):
+                raw_bvs += 0.02
+                strengths.append("written_communication_evidence")
+            if text_has_any(narrative_text, recruiter_terms):
+                raw_bvs += 0.03
+                strengths.append("recruiter_workflow_evidence")
+            if text_has_any(narrative_text, marketplace_terms):
+                raw_bvs += 0.02
+                strengths.append("marketplace_evidence")
+            if text_has_any(narrative_text, open_source_terms):
+                raw_bvs += 0.02
+                strengths.append("open_source_visibility")
+            if text_has_any(narrative_text, nice_to_have_terms):
+                raw_bvs += 0.02
+                strengths.append("nice_to_have_ai_depth")
+
+            has_production = text_has_any(narrative_text, production_terms)
+            has_retrieval = text_has_any(narrative_text, retrieval_terms)
+            has_evaluation = text_has_any(narrative_text, evaluation_terms)
+            has_systems = text_has_any(narrative_text, systems_terms)
+
+            if text_has_any(narrative_text, research_terms) and not has_production:
+                raw_bvs -= 0.06
                 penalties.append("research_only_like")
-            if text_has_any(narrative_text, wrapper_terms) and not text_has_any(narrative_text, retrieval_terms):
-                raw_bvs -= 0.20
+            if text_has_any(narrative_text, wrapper_terms) and not (has_retrieval or has_production or has_systems):
+                raw_bvs -= 0.06
                 penalties.append("wrapper_only_like")
-            if text_has_any(narrative_text, wrong_domain_terms) and not text_has_any(narrative_text, retrieval_terms):
-                raw_bvs -= 0.18
+            if text_has_any(narrative_text, wrong_domain_terms) and not (has_retrieval or has_systems):
+                raw_bvs -= 0.05
                 penalties.append("wrong_domain_like")
-            if text_has_any(narrative_text, ("framework", "frameworks", "notebook", "poc", "prototype", "tutorial", "demo")) and not text_has_any(narrative_text, systems_terms):
-                raw_bvs -= 0.18
+            if text_has_any(narrative_text, ("framework", "frameworks", "notebook", "poc", "prototype", "tutorial", "demo")) and not (has_systems or has_retrieval or has_production):
+                raw_bvs -= 0.05
                 penalties.append("framework_demo_only_like")
+            if not has_evaluation and has_retrieval:
+                raw_bvs -= 0.02
+                penalties.append("limited_evaluation_terms")
+            if not has_retrieval and (has_production or has_systems):
+                raw_bvs -= 0.02
+                penalties.append("limited_retrieval_depth")
 
             if text_has_any(narrative_text, ("owned", "led", "architected", "built from scratch", "end to end", "cross functional")):
-                raw_bvs += 0.08
+                raw_bvs += 0.05
                 strengths.append("narrative_ownership")
         
         final_bvs = shape_bvs_score(clamp01(raw_bvs))
-        if final_bvs < threshold:
-            discarded.append({"candidate_id": cand_id, "reason": f"below_bvs_threshold={final_bvs:.3f}"})
-            continue
 
         surviving.append(
             CandidateRecord(
@@ -2219,6 +2472,123 @@ def select_cross_encoder_chunk_indices(
     return select_family_covered_ce_chunks(row, chunks, chunk_focus_weights)
 
 
+def background_negative_risk(
+    bi_row: np.ndarray,
+    chunks: list[Chunk],
+    verified_negative_indices: Iterable[int],
+    threshold: float = BACKGROUND_NEGATIVE_BI_THRESHOLD,
+    strong_threshold: float = 0.60,
+) -> tuple[float, list[int]]:
+    verified = set(verified_negative_indices)
+    hits: list[tuple[float, float, int]] = []
+    for idx, chunk in enumerate(chunks):
+        if chunk.polarity != "negative" or idx in verified:
+            continue
+        similarity = float(bi_row[idx])
+        if similarity < threshold:
+            continue
+        weight = max(0.0, float(effective_chunk_weight(chunk)))
+        if weight <= 0.0:
+            continue
+        hits.append((similarity, weight, idx))
+
+    if not hits:
+        return 0.0, []
+
+    denominator = sum(weight for _, weight, _ in hits)
+    weighted_mean = sum(similarity * weight for similarity, weight, _ in hits) / max(denominator, 1e-6)
+    weighted_consensus = sum(weight for similarity, weight, _ in hits if similarity >= strong_threshold) / max(denominator, 1e-6)
+    risk = clamp01((0.60 * weighted_mean) + (0.40 * weighted_consensus))
+    selected = [idx for _, _, idx in sorted(hits, key=lambda item: (-item[0] * item[1], chunks[item[2]].id))]
+    return risk, selected
+
+
+def complementary_biencoder_support(
+    bi_row: np.ndarray,
+    chunks: list[Chunk],
+    verified_positive_indices: Iterable[int],
+    verified_ce_score: float = 0.0,
+    verified_family_coverage: int = 0,
+    threshold: float = COMPLEMENTARY_BI_THRESHOLD,
+    max_chunks: int = COMPLEMENTARY_BI_MAX_CHUNKS,
+) -> tuple[float, list[int]]:
+    verified = set(verified_positive_indices)
+    ce_families = {chunk_family(chunks[idx].id) for idx in verified if 0 <= idx < len(chunks)}
+    candidates: list[tuple[float, float, int, str]] = []
+    hard_cap = max(0, min(int(max_chunks), COMPLEMENTARY_BI_MAX_CHUNKS))
+    if hard_cap <= 0:
+        return 0.0, []
+    if verified_ce_score >= 0.70:
+        adaptive_max = 2
+    elif verified_ce_score >= 0.45:
+        adaptive_max = 3
+    else:
+        adaptive_max = 4
+    adaptive_max = min(adaptive_max, hard_cap)
+    core_families = {"RETRIEVAL", "EVALUATION", "SYSTEMS", "PRODUCT"}
+    if verified_family_coverage >= 5 or len(ce_families & core_families) >= 3:
+        adaptive_max = max(1, adaptive_max - 1)
+    adaptive_max = min(adaptive_max, hard_cap)
+
+    for idx, chunk in enumerate(chunks):
+        if chunk.polarity != "positive" or idx in verified:
+            continue
+        similarity = float(bi_row[idx])
+        if similarity < threshold:
+            continue
+        weight = max(0.0, float(effective_chunk_weight(chunk)))
+        if weight <= 0.0:
+            continue
+        candidates.append((similarity, weight, idx, chunk_family(chunk.id)))
+
+    if not candidates:
+        return 0.0, []
+
+    selected: list[tuple[float, float, int, str]] = []
+    selected_indices: set[int] = set()
+    family_counts: Counter[str] = Counter()
+
+    unused_family_best: dict[str, tuple[float, float, int, str]] = {}
+    for item in candidates:
+        similarity, weight, idx, family = item
+        if family in ce_families:
+            continue
+        score = similarity * math.sqrt(max(weight, 1e-6))
+        current = unused_family_best.get(family)
+        if current is None or score > current[0] * math.sqrt(max(current[1], 1e-6)):
+            unused_family_best[family] = item
+
+    for item in sorted(unused_family_best.values(), key=lambda item: (-item[0] * math.sqrt(max(item[1], 1e-6)), chunks[item[2]].id)):
+        if len(selected) >= adaptive_max:
+            break
+        selected.append(item)
+        selected_indices.add(item[2])
+        family_counts[item[3]] += 1
+
+    remaining = sorted(
+        (item for item in candidates if item[2] not in selected_indices),
+        key=lambda item: (-item[0] * math.sqrt(max(item[1], 1e-6)), chunks[item[2]].id),
+    )
+    for item in remaining:
+        if len(selected) >= adaptive_max:
+            break
+        family = item[3]
+        if family_counts[family] >= 2:
+            continue
+        selected.append(item)
+        selected_indices.add(item[2])
+        family_counts[family] += 1
+
+    if not selected:
+        return 0.0, []
+
+    numerator = sum(similarity * weight for similarity, weight, _, _ in selected)
+    denominator = sum(weight for _, weight, _, _ in selected)
+    weighted_support = numerator / max(denominator, 1e-6)
+    support = clamp01(1.0 - math.exp(-1.7 * weighted_support))
+    return support, [idx for _, _, idx, _ in selected]
+
+
 
 def compute_cross_encoder_scores(
     candidates: list[CandidateRecord],
@@ -2408,6 +2778,8 @@ def make_reasoning(
     candidate: CandidateRecord,
     chunks: list[Chunk],
     adjusted_scores: np.ndarray,
+    background_positive_scores: np.ndarray | None = None,
+    background_negative_scores: np.ndarray | None = None,
 ) -> str:
     pos = [
         (float(adjusted_scores[idx]), idx)
@@ -2419,8 +2791,31 @@ def make_reasoning(
         for idx, chunk in enumerate(chunks)
         if chunk.polarity == "negative" and adjusted_scores[idx] > 0.05
     ]
-    pos.sort(reverse=True)
-    neg.sort(reverse=True)
+    background_pos = [
+        (float(background_positive_scores[idx]), idx)
+        for idx, chunk in enumerate(chunks)
+        if background_positive_scores is not None and chunk.polarity == "positive" and background_positive_scores[idx] > 0.05
+    ]
+    background_neg = [
+        (float(background_negative_scores[idx]), idx)
+        for idx, chunk in enumerate(chunks)
+        if background_negative_scores is not None and chunk.polarity == "negative" and background_negative_scores[idx] > 0.05
+    ]
+
+    def sort_evidence(items: list[tuple[float, int]]) -> list[tuple[float, int]]:
+        return sorted(
+            items,
+            key=lambda item: (
+                -float(effective_chunk_weight(chunks[item[1]])),
+                -float(item[0]),
+                chunks[item[1]].id,
+            ),
+        )
+
+    pos = sort_evidence(pos)
+    background_pos = sort_evidence(background_pos)
+    neg = sort_evidence(neg)
+    background_neg = sort_evidence(background_neg)
 
     def to_text(value: Any) -> str:
         if value is None:
@@ -2488,6 +2883,52 @@ def make_reasoning(
             "CULTURE": "communication",
             "ADVANCED": "advanced",
         }.get(family, "direct_fit")
+
+    def family_phrase(families: list[str]) -> str:
+        labels = {
+            "RETRIEVAL": "retrieval and ranking",
+            "EVALUATION": "evaluation",
+            "SYSTEMS": "systems engineering",
+            "PRODUCT": "production delivery",
+            "DOMAIN": "recruiter workflow",
+            "CULTURE": "async collaboration",
+            "ADVANCED": "advanced AI work",
+            "NEGATIVE": "risk signals",
+        }
+        names = [labels.get(family, family.lower()) for family in families if family]
+        names = list(dict.fromkeys(names))
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+    def top_families(items: list[tuple[float, int]], limit: int = 3) -> list[str]:
+        out: list[str] = []
+        for _, idx in items:
+            family = chunk_family(chunks[idx].id)
+            if family not in out:
+                out.append(family)
+            if len(out) >= limit:
+                break
+        return out
+
+    def risk_phrase(items: list[tuple[float, int]], limit: int = 1) -> str:
+        labels = {
+            "C19": "research-heavy experience without production proof",
+            "C20": "wrapper-style AI work without retrieval depth",
+            "C21": "hands-off architecture risk",
+            "C22": "CV, speech, or robotics domain mismatch",
+            "C23": "limited external validation",
+            "C24": "demo or framework-only systems depth",
+        }
+        phrases = [labels.get(chunks[idx].id, chunk_label(chunks[idx]).lower()) for _, idx in items[:limit]]
+        phrases = list(dict.fromkeys(phrases))
+        if not phrases:
+            return ""
+        if len(phrases) == 1:
+            return phrases[0]
+        return " and ".join(phrases)
 
     def sentence_topic(text: Any) -> str:
         s = normalize_text(text).lower()
@@ -2593,6 +3034,16 @@ def make_reasoning(
     recruiter_domain_terms = ("hr", "recruiting", "talent", "ats", "hiring", "candidate", "recruiter")
     communication_terms = ("async", "asynchronous", "disagree", "disagreement", "documentation", "docs", "decision making", "communication", "writing")
     advanced_terms = ("graphrag", "graph rag", "knowledge graph", "neo4j", "entity resolution", "graph search")
+    reason_stop_terms = {"candidate", "candidates", "evidence", "experience", "profile", "work", "role", "job", "jobs"}
+
+    scored_chunk_terms: tuple[str, ...] = tuple(
+        dict.fromkeys(
+            term.lower()
+            for _, idx in pos[:5]
+            for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query)
+            if term and len(term) >= 2 and term.lower() not in reason_stop_terms
+        )
+    )
 
     family_peaks: dict[str, float] = {}
     for score, idx in pos[:8]:
@@ -2756,7 +3207,12 @@ def make_reasoning(
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
         return bank[int(digest[:8], 16) % len(bank)]
 
-    opener = bank_pick(dominant_bucket, dominant_score)
+    verified_families = top_families(pos, 1)
+    verified_phrase = family_phrase(verified_families)
+    if verified_phrase:
+        opener = f"Verified positive evidence is strongest around {verified_phrase}."
+    else:
+        opener = bank_pick(dominant_bucket, dominant_score)
 
     def is_artifact_like(sentence: Any) -> bool:
         s = normalize_text(sentence).lower()
@@ -2830,7 +3286,9 @@ def make_reasoning(
         "recruiter_domain": recruiter_domain_terms + communication_terms,
         "direct_fit": production_terms + retrieval_terms + evaluation_terms + systems_terms + ownership_terms + recruiter_domain_terms,
     }
-    target_terms = archetype_terms.get(dominant_bucket, archetype_terms["direct_fit"])
+    target_terms = tuple(
+        dict.fromkeys(scored_chunk_terms + archetype_terms.get(dominant_bucket, archetype_terms["direct_fit"]))
+    )
 
     used_topics: set[str] = {dominant_bucket}
     evidence_snippets: list[str] = []
@@ -2928,6 +3386,10 @@ def make_reasoning(
         if raw_l == "aging_activity":
             return "activity", "recent activity is a bit older", 1
         if raw_l.startswith("notice_period="):
+            match = re.search(r"notice_period=(\d+)d", raw_l)
+            days = as_int(match.group(1), 0) if match else 0
+            if days >= 60:
+                return "activity", "the notice period is long", 2
             return "activity", "the notice period is a bit longer", 1
         return "balanced", normalize_text(raw).replace("_", " ").replace("=", ": "), 1
 
@@ -2977,17 +3439,22 @@ def make_reasoning(
             return "balanced"
 
         translated_map = [(bucket_of_strength(raw), phrase) for raw, phrase in (translate_strength(s) for s in strengths_raw)]
+        skip_behavioral_secondary = bool(evidence_snippets)
         seen: set[str] = set()
         for bucket in priority.get(dominant_bucket, ("production", "ownership", "retrieval", "evaluation", "systems", "recruiter_domain", "communication", "activity", "balanced")):
             if bucket == dominant_bucket:
                 continue
             for raw_bucket, phrase in translated_map:
+                if skip_behavioral_secondary and raw_bucket in {"activity", "balanced"}:
+                    continue
                 key = phrase.lower()
                 if raw_bucket == bucket and key not in seen and all(key not in e.lower() for e in evidence_snippets):
                     seen.add(key)
                     return phrase
 
         for raw_bucket, phrase in translated_map:
+            if skip_behavioral_secondary and raw_bucket in {"activity", "balanced"}:
+                continue
             key = phrase.lower()
             if raw_bucket != dominant_bucket and key not in seen and all(key not in e.lower() for e in evidence_snippets):
                 return phrase
@@ -3036,6 +3503,36 @@ def make_reasoning(
         return bank[int(digest[:8], 16) % len(bank)].format(s=s)
 
     evidence_sentence = make_evidence_sentence()
+    verified_positive_sentence = opener
+    if verified_phrase and evidence_snippets:
+        verified_positive_sentence = f"Verified {verified_phrase} evidence: {evidence_snippets[0]}."
+    elif evidence_sentence:
+        verified_positive_sentence = evidence_sentence
+
+    def make_background_strength_sentence() -> str | None:
+        background_families = [family for family in top_families(background_pos, 1) if family not in verified_families]
+        if not background_families:
+            return None
+        phrase = family_phrase(background_families)
+        if not phrase:
+            return None
+        return f"Additional background semantic support shows alignment in {phrase}."
+
+    def make_background_risk_sentence() -> str | None:
+        phrase = risk_phrase(background_neg)
+        if not phrase:
+            return None
+        return f"Background semantic risk also points to {phrase}."
+
+    def make_verified_risk_sentence() -> str | None:
+        phrase = risk_phrase(neg)
+        if not phrase:
+            return None
+        return f"Verified negative evidence raises concern around {phrase}."
+
+    background_strength_sentence = make_background_strength_sentence()
+    background_risk_sentence = make_background_risk_sentence()
+    verified_risk_sentence = make_verified_risk_sentence()
 
     def make_secondary_sentence() -> str | None:
         if not secondary_strength:
@@ -3054,15 +3551,21 @@ def make_reasoning(
 
     secondary_sentence = make_secondary_sentence()
 
-    sentences: list[str] = [opener]
-    if evidence_sentence:
-        sentences.append(evidence_sentence)
-    if secondary_sentence:
+    sentences: list[str] = []
+    if verified_positive_sentence:
+        sentences.append(verified_positive_sentence)
+    if background_strength_sentence:
+        sentences.append(background_strength_sentence)
+    if secondary_sentence and not (background_strength_sentence or verified_risk_sentence or background_risk_sentence):
         if evidence_sentence and secondary_sentence.lower() == evidence_sentence.lower():
             secondary_sentence = None
         if secondary_sentence:
             sentences.append(secondary_sentence)
-    if risk_sentence:
+    if verified_risk_sentence:
+        sentences.append(verified_risk_sentence)
+    if background_risk_sentence:
+        sentences.append(background_risk_sentence)
+    if risk_sentence and not (verified_risk_sentence or background_risk_sentence):
         sentences.append(risk_sentence)
 
     final_text = " ".join(sentences).strip()
@@ -3070,7 +3573,7 @@ def make_reasoning(
     if len(words) > 60:
         final_text = " ".join(words[:60]).rstrip(" .;:") + "."
 
-    if len(final_text.split()) < 40 and len(evidence_snippets) > 1:
+    if len(final_text.split()) < 40 and len(evidence_snippets) > 1 and len(sentences) <= 1:
         extra = f"Another example is {evidence_snippets[1]}."
         if len((final_text + " " + extra).split()) <= 60 and extra.lower() not in final_text.lower():
             final_text = (final_text + " " + extra).strip()
@@ -3088,21 +3591,63 @@ def write_top_output(
     candidates: list[CandidateRecord],
     chunks: list[Chunk],
     adjusted_scores: np.ndarray,
+    background_positive_scores: np.ndarray | None,
+    background_negative_scores: np.ndarray | None,
     top_k: int,
-) -> None:
+    diagnostics_by_candidate: dict[int, dict[str, float]] | None = None,
+    debug_top_k: int | None = None,
+) -> list[dict[str, Any]]:
+    ranked_rows: list[dict[str, Any]] = []
+    row_limit = max(top_k, int(debug_top_k or top_k))
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"])
+        writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"], extrasaction="ignore")
         writer.writeheader()
-        for rank, cand_idx in enumerate(ranked[:top_k], 1):
-            writer.writerow(
-                {
-                    "candidate_id": candidates[cand_idx].candidate_id,
-                    "rank": rank,
-                    "score": f"{float(final_scores[cand_idx]):.8f}",
-                    "reasoning": make_reasoning(candidates[cand_idx], chunks, adjusted_scores[cand_idx]),
-                }
-            )
+        for rank, cand_idx in enumerate(ranked[:row_limit], 1):
+            row: dict[str, Any] = {
+                "candidate_id": candidates[cand_idx].candidate_id,
+                "rank": rank,
+                "score": f"{float(final_scores[cand_idx]):.8f}",
+                "reasoning": make_reasoning(
+                    candidates[cand_idx],
+                    chunks,
+                    adjusted_scores[cand_idx],
+                    None if background_positive_scores is None else background_positive_scores[cand_idx],
+                    None if background_negative_scores is None else background_negative_scores[cand_idx],
+                ),
+                "Rank": rank,
+                "Candidate ID": candidates[cand_idx].candidate_id,
+                "Final Score": float(final_scores[cand_idx]),
+            }
+            if diagnostics_by_candidate and cand_idx in diagnostics_by_candidate:
+                row.update(diagnostics_by_candidate[cand_idx])
+            ranked_rows.append(row)
+            if rank <= top_k:
+                writer.writerow(row)
+    return ranked_rows
 
+
+def write_score_distribution(path: Path, ranked_rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "Rank",
+        "Candidate ID",
+        "Final Score",
+        "Semantic Score",
+        "CrossEncoder Score",
+        "BiEncoder Score",
+        "BM25 Score",
+        "Adaptive CE Weight",
+        "Adaptive BE Weight",
+        "Adaptive BM25 Weight",
+        "Coverage",
+        "Evidence Density",
+        "BVS",
+        "Negative Penalty",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in ranked_rows[:100]:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 def write_scores_output(
     path: Path,
@@ -3385,8 +3930,10 @@ def run(args: argparse.Namespace) -> int:
 
     ce_family_counter: Counter[str] = Counter()
     ce_chunk_counts: list[int] = []
+    selection_plans_by_candidate: dict[int, ChunkSelectionPlan] = {}
     for shortlist_pos, cand_idx in enumerate(shortlist):
         plan = select_cross_encoder_chunk_indices(cand_idx, chunks, hybrid_scores, chunk_focus_weights)
+        selection_plans_by_candidate[cand_idx] = plan
         ce_chunk_count = len(dict.fromkeys(plan.ce_positive_indices + plan.ce_negative_indices))
         ce_chunk_counts.append(ce_chunk_count)
         family_scores = family_score_matrix(vector_scores[[cand_idx]], chunks)
@@ -3405,8 +3952,20 @@ def run(args: argparse.Namespace) -> int:
     for offset, cand_idx in enumerate(shortlist):
         cross_adjusted_full[cand_idx] = cross_adjusted_shortlist[offset]
 
+    background_positive_full = np.zeros_like(adjusted_scores, dtype=np.float32)
+    background_negative_full = np.zeros_like(adjusted_scores, dtype=np.float32)
 
     final_scores = np.full(len(candidates), -np.inf, dtype=np.float32)
+    semantic_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    cross_encoder_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    biencoder_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    bm25_component_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    adaptive_ce_weights = np.full(len(candidates), np.nan, dtype=np.float32)
+    adaptive_be_weights = np.full(len(candidates), np.nan, dtype=np.float32)
+    adaptive_bm25_weights = np.full(len(candidates), np.nan, dtype=np.float32)
+    coverage_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    evidence_density_scores = np.full(len(candidates), np.nan, dtype=np.float32)
+    negative_penalty_scores = np.full(len(candidates), np.nan, dtype=np.float32)
     coverage_bonus_values: list[float] = []
     evidence_bonus_values: list[float] = []
     negative_conf_values: list[float] = []
@@ -3417,7 +3976,6 @@ def run(args: argparse.Namespace) -> int:
 
     for offset, cand_idx in enumerate(shortlist):
         ce_tech = float(cross_scores_shortlist[offset])
-        semantic_boost = float(semantic_final_norm[cand_idx])
         behavior_boost = float(bvs_scores[cand_idx]) - 0.5
 
         adjusted_row = np.asarray(cross_adjusted_full[cand_idx], dtype=np.float32)
@@ -3430,6 +3988,32 @@ def run(args: argparse.Namespace) -> int:
         # Lower disagreement means higher confidence in the Cross-Encoder signal.
         bm25_row = np.asarray(bm25_scores[cand_idx], dtype=np.float32).ravel()
         bi_row = np.asarray(vector_scores[cand_idx], dtype=np.float32).ravel()
+        plan = selection_plans_by_candidate.get(cand_idx)
+        verified_positive_indices = plan.ce_positive_indices if plan else []
+        verified_negative_indices = plan.ce_negative_indices if plan else []
+        verified_positive_families = {
+            chunk_family(chunks[idx].id)
+            for idx in verified_positive_indices
+            if 0 <= idx < len(chunks)
+        }
+        background_support, background_positive_indices = complementary_biencoder_support(
+            bi_row,
+            chunks,
+            verified_positive_indices,
+            verified_ce_score=ce_tech,
+            verified_family_coverage=len(verified_positive_families),
+        )
+        background_risk, background_negative_indices = background_negative_risk(
+            bi_row,
+            chunks,
+            verified_negative_indices,
+        )
+        for chunk_idx in background_positive_indices:
+            background_positive_full[cand_idx, chunk_idx] = float(bi_row[chunk_idx]) * float(effective_chunk_weight(chunks[chunk_idx]))
+        for chunk_idx in background_negative_indices:
+            background_negative_full[cand_idx, chunk_idx] = float(bi_row[chunk_idx]) * float(effective_chunk_weight(chunks[chunk_idx]))
+        verified_negative_risk = clamp01(float(cross_neg_scores[offset]))
+        combined_negative_risk = clamp01((0.70 * verified_negative_risk) + (0.30 * background_risk))
 
         def _top3_mean(values: np.ndarray) -> float:
             vec = np.asarray(values, dtype=np.float32).ravel()
@@ -3443,7 +4027,7 @@ def run(args: argparse.Namespace) -> int:
             return float(np.mean(top))
 
         bm25_proxy = clamp01(_top3_mean(bm25_row))
-        bi_proxy = clamp01(_top3_mean(bi_row))
+        bi_proxy = clamp01(background_support)
         ce_proxy = clamp01(float(ce_tech))
 
         agreement = 1.0 - (
@@ -3455,13 +4039,13 @@ def run(args: argparse.Namespace) -> int:
         smart_multiplier = 0.90 + 0.10 * agreement
 
         # Apply the smart multiplier only to the Cross-Encoder contribution.
-        ce_risk_multiplier = math.exp(-max(0.0, float(cross_neg_scores[offset])) * 2.4)
+        ce_risk_multiplier = math.exp(-max(0.0, combined_negative_risk) * 2.4)
         ce_adjusted = ce_tech * smart_multiplier * ce_risk_multiplier
 
         # Adaptive reliability-weighted semantic fusion: keep the base mix stable,
         # but apply only a small consensus-aware calibration to the three retrieval signals.
-        semantic_proxy = float(math.pow(clamp01(semantic_boost), 0.92))
-        fusion_base = np.asarray([0.55, 0.25, 0.20], dtype=np.float32)
+        semantic_proxy = float(math.pow(clamp01(background_support), 0.92))
+        fusion_base = np.asarray([0.60, 0.30, 0.10], dtype=np.float32)
         fusion_signals = np.asarray([ce_adjusted, semantic_proxy, bm25_proxy], dtype=np.float32)
 
         signal_proxies = np.asarray([
@@ -3476,7 +4060,7 @@ def run(args: argparse.Namespace) -> int:
         reliability_weights = raw_reliability / float(np.sum(raw_reliability))
 
         # Keep shifts small so the ensemble remains stable and close to the
-        # original 0.55 / 0.25 / 0.20 blend.
+        # original 0.60 / 0.30 / 0.10 blend.
         fusion_weights = (0.92 * fusion_base) + (0.08 * reliability_weights)
         fusion_weights = fusion_weights / float(np.sum(fusion_weights))
         semantic_core = float(np.dot(fusion_weights, fusion_signals))
@@ -3494,6 +4078,16 @@ def run(args: argparse.Namespace) -> int:
         # Narrative negative confidence acts as a calibrated risk penalty.
         narrative_penalty = negative_confidence_penalty(negative_conf)
         final_scores[cand_idx] = final_raw * narrative_penalty
+        semantic_component_scores[cand_idx] = float(semantic_core)
+        cross_encoder_component_scores[cand_idx] = float(ce_tech)
+        biencoder_component_scores[cand_idx] = float(bi_proxy)
+        bm25_component_scores[cand_idx] = float(bm25_proxy)
+        adaptive_ce_weights[cand_idx] = float(fusion_weights[0])
+        adaptive_be_weights[cand_idx] = float(fusion_weights[1])
+        adaptive_bm25_weights[cand_idx] = float(fusion_weights[2])
+        coverage_scores[cand_idx] = float(coverage_quality)
+        evidence_density_scores[cand_idx] = float(evidence_quality)
+        negative_penalty_scores[cand_idx] = float(narrative_penalty)
 
         coverage_bonus_values.append(coverage_bonus)
         evidence_bonus_values.append(evidence_bonus)
@@ -3533,7 +4127,37 @@ def run(args: argparse.Namespace) -> int:
             "Increase --shortlist-size or use --allow-fewer-than-top-k for smoke tests."
         )
     # -----------------------------------
-    write_top_output(output_path, ranked, final_scores, candidates, chunks, cross_adjusted_full, min(args.top_k, len(ranked)))
+    diagnostic_rank_limit = min(100, len(ranked))
+    diagnostics_by_candidate = {
+        cand_idx: {
+            "Semantic Score": float(semantic_component_scores[cand_idx]),
+            "CrossEncoder Score": float(cross_encoder_component_scores[cand_idx]),
+            "BiEncoder Score": float(biencoder_component_scores[cand_idx]),
+            "BM25 Score": float(bm25_component_scores[cand_idx]),
+            "Adaptive CE Weight": float(adaptive_ce_weights[cand_idx]),
+            "Adaptive BE Weight": float(adaptive_be_weights[cand_idx]),
+            "Adaptive BM25 Weight": float(adaptive_bm25_weights[cand_idx]),
+            "Coverage": float(coverage_scores[cand_idx]),
+            "Evidence Density": float(evidence_density_scores[cand_idx]),
+            "BVS": float(bvs_scores[cand_idx]),
+            "Negative Penalty": float(negative_penalty_scores[cand_idx]),
+        }
+        for cand_idx in ranked[:diagnostic_rank_limit]
+    }
+    ranked_rows = write_top_output(
+        output_path,
+        ranked,
+        final_scores,
+        candidates,
+        chunks,
+        cross_adjusted_full,
+        background_positive_full,
+        background_negative_full,
+        min(args.top_k, len(ranked)),
+        diagnostics_by_candidate,
+        diagnostic_rank_limit,
+    )
+    write_score_distribution(output_path.parent / "score_distribution_top100.csv", ranked_rows)
 
     if args.scores_output:
         write_scores_output(
