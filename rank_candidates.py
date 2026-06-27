@@ -4415,6 +4415,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return run(args)
+    except KeyboardInterrupt:
+        print(
+            "[ranker] INTERRUPTED: received a Ctrl+C/Stop signal from the terminal, IDE, or parent runner. "
+            "This is not a JSON parsing error; rerun without stopping the process.",
+            file=sys.stderr,
+        )
+        return 130
     except Exception as exc:
         print(f"[ranker] ERROR: {exc}", file=sys.stderr)
         return 1
