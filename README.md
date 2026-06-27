@@ -563,6 +563,8 @@ The ranking output is intentionally limited to `Real_RR.csv`. Model and embeddin
 
 The explanation text in the final output is generated from candidate narrative text, structured BVS signals, and the selected evidence passages. Internal retrieval tags are used only for retrieval and do not need to appear in the final explanation.
 
+The recruiter-facing reasoning layer is display-only and does not affect rank or score. It prefers concrete production search, retrieval, ranking, evaluation, scale, and ownership evidence; filters out aspirational or self-directed claims as primary proof; and explicitly labels adjacent systems/data profiles when direct production search or ranking ownership is not established.
+
 ---
 
 # Caching

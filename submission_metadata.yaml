@@ -73,6 +73,12 @@ methodology_summary: |
   resemble real-world recruiter decision making while remaining efficient enough
   for CPU-only execution.
 
+  The public reasoning column is generated after scoring from already-selected
+  evidence and structured signals. It is intentionally recruiter-facing: strong
+  candidates are justified with concrete production search/ranking evidence,
+  while adjacent systems or data profiles are described with explicit caveats
+  rather than being overstated as proven ranking-system owners.
+
 declarations:
   read_submission_spec: true
   code_is_original_work: true
