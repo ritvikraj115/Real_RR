@@ -2928,6 +2928,30 @@ def make_reasoning(
         )
         if any(marker in sentence_l for marker in blocked):
             return True
+        unsupported_evidence = (
+            "looking to ",
+            "interested in transitioning",
+            "start contributing",
+            "self-learner",
+            "self directed",
+            "self-directed",
+            "online courses",
+            "played with",
+            "side project",
+            "haven't done it in a professional capacity",
+            "have not done it in a professional capacity",
+            "still building depth",
+            "building competence",
+            "not the model itself",
+            "handled by another team",
+            "handled by the platform team",
+            "wouldn't call myself",
+            "would not call myself",
+            "professional experience there is limited",
+            "my professional experience there is limited",
+        )
+        if any(marker in sentence_l for marker in unsupported_evidence):
+            return True
         tokens = tokenize(sentence_l)
         if len(tokens) <= 8 and sum(1 for token in tokens if token in {"retrieval", "ranking", "search", "production", "evaluation", "systems"}) >= 3:
             return True
@@ -2980,6 +3004,42 @@ def make_reasoning(
     recruiter_terms = ("recruiter", "recruiting", "talent", "ats", "hiring", "candidate workflow")
     marketplace_terms = ("marketplace", "matching", "supply", "demand", "two-sided")
     writing_terms = ("async", "asynchronous", "documentation", "docs", "writing", "design doc", "decision memo")
+    adjacent_title_terms = (
+        "data engineer",
+        "analytics engineer",
+        "cloud engineer",
+        "frontend engineer",
+        "qa engineer",
+        ".net developer",
+        "java developer",
+        "backend systems",
+        "data pipelines",
+        "sql, spark",
+    )
+    weak_professional_ml_terms = (
+        "self-learner",
+        "self directed",
+        "self-directed",
+        "online courses",
+        "played with",
+        "side project",
+        "haven't done it in a professional capacity",
+        "have not done it in a professional capacity",
+        "interested in transitioning",
+        "start contributing to ml-adjacent",
+        "still building depth",
+        "building competence on the ml side",
+        "professional experience there is limited",
+    )
+    limited_ownership_terms = (
+        "not the model itself",
+        "handled by another team",
+        "handled by the platform team",
+        "pure ml side of the work",
+        "deployment was handled",
+        "bulk of the role was data infrastructure",
+        "some adjacent ml exposure",
+    )
 
     def family_set(items: list[tuple[float, int]]) -> set[str]:
         return {chunk_family(chunks[idx].id) for _, idx in items if 0 <= idx < len(chunks)}
@@ -3034,6 +3094,16 @@ def make_reasoning(
     primary_strength = strengths[0][1] if strengths else "the role requirements"
     secondary_strengths = [label for _, label, _ in strengths[1:4]]
 
+    def profile_role_label() -> str:
+        profile_line = normalize_text(candidate.candidate_texts[0] if candidate.candidate_texts else "")
+        match = re.search(r"headline:\s*(.+?)(?:\.\s*summary:|$)", profile_line, flags=re.IGNORECASE)
+        headline = match.group(1).strip() if match else profile_line
+        role = headline.split("|", 1)[0].strip().rstrip(".")
+        role = re.sub(r"\s+", " ", role)
+        if not role or len(role.split()) > 6 or has_banned_output_term(role):
+            return ""
+        return role
+
     def deterministic_pick(options: list[str], salt: str) -> str:
         if not options:
             return ""
@@ -3041,10 +3111,68 @@ def make_reasoning(
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
         return options[int(digest[:8], 16) % len(options)]
 
+    def sentence_has_any(sentence: str, terms: tuple[str, ...]) -> bool:
+        sentence_l = sentence.lower()
+        return any(term in sentence_l for term in terms)
+
+    def low_confidence_sentence(sentence: str) -> bool:
+        return sentence_has_any(sentence, weak_professional_ml_terms + limited_ownership_terms)
+
+    def professional_core_sentence(sentence: str) -> bool:
+        if low_confidence_sentence(sentence):
+            return False
+        has_core = sentence_has_any(sentence, retrieval_terms + ranking_terms + vector_terms + evaluation_terms)
+        has_delivery = sentence_has_any(sentence, production_terms + deployment_terms + scale_terms + impact_terms)
+        has_action = sentence_has_any(sentence, ownership_terms + migration_terms + (
+            "built",
+            "developed",
+            "designed",
+            "implemented",
+            "migrated",
+            "owned",
+            "led",
+            "shipped",
+            "launched",
+            "deployed",
+            "rolled out",
+            "improved",
+            "reduced",
+        ))
+        return bool(has_core and has_action and (has_delivery or sentence_has_any(sentence, evaluation_terms)))
+
+    def adjacent_systems_sentence(sentence: str) -> bool:
+        if low_confidence_sentence(sentence):
+            return False
+        has_systems_signal = sentence_has_any(sentence, systems_terms + (
+            "aws",
+            "kubernetes",
+            "terraform",
+            "ci/cd",
+            "monitoring",
+            "data warehouse",
+            "airflow",
+            "spark",
+            "fastapi",
+            "postgresql",
+        ))
+        has_action = sentence_has_any(sentence, ownership_terms + (
+            "built",
+            "designed",
+            "implemented",
+            "owned",
+            "maintained",
+            "migrated",
+        ))
+        return bool(has_systems_signal and has_action)
+
     def snippet_score(sentence: str, terms: tuple[str, ...]) -> tuple[float, int]:
+        if low_confidence_sentence(sentence):
+            return (-1.0, 0)
         sentence_l = sentence.lower()
         overlap = sum(1 for term in terms if term and term in sentence_l)
         if overlap <= 0:
+            return (-1.0, 0)
+        if not professional_core_sentence(sentence) and not adjacent_systems_sentence(sentence):
             return (-1.0, 0)
         action_bonus = sum(
             1
@@ -3147,6 +3275,10 @@ def make_reasoning(
     scored_snippets.sort(key=lambda item: (-item[0], -item[1], -item[2]))
 
     evidence_snippet = scored_snippets[0][3] if scored_snippets else ""
+    strong_professional_core = bool(evidence_snippet and professional_core_sentence(evidence_snippet))
+    adjacent_systems_fit = bool(evidence_snippet and adjacent_systems_sentence(evidence_snippet) and not strong_professional_core)
+    adjacent_profile = text_has_any(adjacent_title_terms) and not strong_professional_core
+    weak_professional_ml = text_has_any(weak_professional_ml_terms) and not strong_professional_core
 
     def evidence_category(sentence: str) -> str:
         sentence_l = sentence.lower()
@@ -3178,6 +3310,10 @@ def make_reasoning(
         return "general_fit"
 
     opening_category = evidence_category(evidence_snippet)
+    if weak_professional_ml:
+        opening_category = "limited_professional_ml"
+    elif adjacent_profile or adjacent_systems_fit:
+        opening_category = "adjacent_systems"
     category_opening_templates = {
         "production_ownership": [
             "Strong production ownership of search and ranking systems makes this candidate worth interviewing.",
@@ -3229,26 +3365,62 @@ def make_reasoning(
             "Multiple parts of the profile line up with the role's core engineering needs.",
             "The candidate has credible technical overlap with the role's search and ML priorities.",
         ],
+        "adjacent_systems": [
+            "Transferable systems or data-platform experience is the main signal, but the fit is adjacent rather than core search/ranking ownership.",
+            "This profile is more of a systems or data-infrastructure fit than a direct production ranking match.",
+            "The strongest case is engineering depth, with weaker evidence of hands-on search or ranking ownership.",
+        ],
+        "limited_professional_ml": [
+            "This is a lower-confidence fit because the AI/search exposure appears more self-directed than professional production ownership.",
+            "The profile has adjacent engineering experience, but professional search or ranking ownership is not clearly established.",
+            "Recruiters should treat this as an adjacent technical profile rather than a proven production ML ranking hire.",
+        ],
     }
     opening = deterministic_pick(
         category_opening_templates.get(opening_category, category_opening_templates["general_fit"]),
         f"opening-{opening_category}",
     )
+    role_label = profile_role_label()
+    if role_label and opening_category in {"adjacent_systems", "limited_professional_ml"}:
+        opening = deterministic_pick(
+            [
+                "{role} background is adjacent to this role; stronger evidence is in systems or data infrastructure than production search/ranking ownership.",
+                "{role} profile has transferable engineering depth, but direct production search/ranking ownership is not clearly established.",
+                "{role} experience is useful context, though the fit is adjacent rather than a proven production ML ranking match.",
+            ],
+            f"role-opening-{opening_category}",
+        ).format(role=role_label)
+    elif role_label and strong_professional_core:
+        opening = deterministic_pick(
+            [
+                "{role} profile shows direct {strength} experience.",
+                "{role} background maps well to the role through {strength}.",
+                "{role} experience is strongest around {strength}.",
+            ],
+            f"role-opening-{opening_category}",
+        ).format(role=role_label, strength=primary_strength)
 
     support_sentence = ""
     if evidence_snippet:
-        support_sentence = deterministic_pick(
-            [
-                "The strongest example is direct: {snippet}.",
-                "The clearest achievement is concrete: {snippet}.",
-                "The best supporting evidence is practical: {snippet}.",
-                "Recent evidence makes the case: {snippet}.",
-                "The profile gives a specific example: {snippet}.",
-                "A high-value example stands out: {snippet}.",
-                "The interview case is backed by this detail: {snippet}.",
-            ],
-            "support",
-        ).format(snippet=evidence_snippet)
+        if strong_professional_core:
+            support_sentence = deterministic_pick(
+                [
+                    "Best evidence: {snippet}.",
+                    "Concrete proof point: {snippet}.",
+                    "Relevant achievement: {snippet}.",
+                    "Strong supporting detail: {snippet}.",
+                ],
+                "support-strong",
+            ).format(snippet=evidence_snippet)
+        else:
+            support_sentence = deterministic_pick(
+                [
+                    "Transferable evidence: {snippet}.",
+                    "Relevant adjacent evidence: {snippet}.",
+                    "Useful supporting detail: {snippet}.",
+                ],
+                "support-adjacent",
+            ).format(snippet=evidence_snippet)
     elif secondary_strengths:
         support_sentence = f"Additional alignment in {', '.join(secondary_strengths[:2])} broadens the fit beyond a single area."
 
@@ -3271,11 +3443,19 @@ def make_reasoning(
         if raw_l in {"framework_demo_only_like"}:
             return "systems depth may lean closer to prototypes or demos than production infrastructure", 0.20
         if raw_l in {"wrong_domain_like", "title_skill_mismatch"}:
-            return "", 0.0
+            return "current title or domain appears away from hands-on ML search work", 0.25
         if raw_l in {"limited_evaluation_terms"}:
             return "retrieval evidence is stronger than ranking-quality evaluation experience", 0.24
         if raw_l in {"limited_retrieval_depth"}:
             return "broader production or systems evidence is stronger than retrieval depth", 0.24
+        if raw_l.startswith("low_recruiter_response_rate="):
+            return "recruiter response rate could make outreach difficult", 0.27
+        if raw_l.startswith("slow_response="):
+            return "response time could slow recruiter outreach", 0.24
+        if raw_l in {"stale_activity", "aging_activity"}:
+            return "recent platform activity is weaker than ideal", 0.23
+        if raw_l.startswith("low_interview_completion_rate="):
+            return "interview follow-through may need checking", 0.24
         if raw_l.startswith("outside_jd_band="):
             return "level fit may need calibration against the preferred experience band", 0.23
         if raw_l.startswith("notice_period="):
@@ -3364,6 +3544,15 @@ def make_reasoning(
 
     recruiter_constraint_prefixes = ("outside_jd_band=", "notice_period=", "job_hopping")
 
+    def explicit_profile_concern() -> str:
+        if text_has_any(limited_ownership_terms):
+            return "ownership is limited to modeling, integration, or infrastructure rather than end-to-end ranking delivery"
+        if weak_professional_ml:
+            return "AI or search experience is self-directed or exploratory rather than proven in production"
+        if adjacent_profile:
+            return "current experience is adjacent systems or data engineering rather than direct search/ranking ownership"
+        return ""
+
     def penalty_group(raw_l: str) -> int:
         if raw_l.startswith(recruiter_constraint_prefixes):
             return 2
@@ -3390,6 +3579,8 @@ def make_reasoning(
         return candidates_for_group[0][1]
 
     selected_concern = strongest_verified_concern()
+    if not selected_concern:
+        selected_concern = explicit_profile_concern()
     if not selected_concern:
         selected_concern = strongest_penalty_concern(1, structured_weakness_threshold)
     if not selected_concern:
