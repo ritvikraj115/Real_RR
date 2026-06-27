@@ -1640,7 +1640,7 @@ def compute_honeypot_score(candidate: dict[str, Any]) -> dict[str, Any]:
             interval_end = end
             if interval_end is None and is_current and duration_months > 0:
                 interval_end = add_months(start, duration_months)
-            if interval_end >= start:
+            if interval_end is not None and interval_end >= start:
                 full_time_intervals.append((start, interval_end))
             if end and duration_months >= 0:
                 actual_months = calendar_months(start, end)
