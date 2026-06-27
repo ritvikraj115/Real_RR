@@ -3011,8 +3011,6 @@ def make_reasoning(
 
     text_blob = normalize_text(" ".join([
         candidate_text,
-        normalize_text(candidate.bvs_strengths),
-        normalize_text(candidate.bvs_penalties),
     ])).lower()
 
     def text_has_any(terms: tuple[str, ...]) -> bool:
@@ -3052,6 +3050,13 @@ def make_reasoning(
         "online courses",
         "played with",
         "side project",
+        "curious about how ai tools",
+        "experimented with chatgpt",
+        "productivity and content creation",
+        "emerging ai capabilities",
+        "ai-assisted content production",
+        "using llm tools for research",
+        "using llm tools for research, drafting, and editing",
         "haven't done it in a professional capacity",
         "have not done it in a professional capacity",
         "interested in transitioning",
@@ -3140,6 +3145,29 @@ def make_reasoning(
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
         return options[int(digest[:8], 16) % len(options)]
 
+    def is_engineering_role(role: str) -> bool:
+        role_l = role.lower()
+        return any(
+            term in role_l
+            for term in (
+                "engineer",
+                "developer",
+                "architect",
+                "scientist",
+                "ml",
+                "machine learning",
+                "data",
+                "cloud",
+                "backend",
+                "frontend",
+                "full stack",
+                "full-stack",
+                "qa",
+                "sre",
+                "devops",
+            )
+        )
+
     def sentence_has_any(sentence: str, terms: tuple[str, ...]) -> bool:
         sentence_l = sentence.lower()
         return any(term in sentence_l for term in terms)
@@ -3150,7 +3178,40 @@ def make_reasoning(
     def professional_core_sentence(sentence: str) -> bool:
         if low_confidence_sentence(sentence):
             return False
-        has_core = sentence_has_any(sentence, retrieval_terms + ranking_terms + vector_terms + evaluation_terms)
+        ml_context_terms = (
+            "machine learning",
+            " ml ",
+            "ai/ml",
+            "model",
+            "models",
+            "nlp",
+            "llm",
+            "rag",
+            "xgboost",
+            "lightgbm",
+            "recommendation",
+            "recommender",
+        )
+        has_search_or_ml_core = sentence_has_any(sentence, retrieval_terms + ranking_terms + vector_terms + ml_context_terms)
+        has_eval_with_ml_context = sentence_has_any(sentence, evaluation_terms) and sentence_has_any(
+            sentence,
+            retrieval_terms
+            + ranking_terms
+            + vector_terms
+            + (
+                "model",
+                "models",
+                "metrics",
+                "offline-online",
+                "offline online",
+                "offline metrics",
+                "online metrics",
+                "a/b test",
+                "ab test",
+                "relevance",
+            ),
+        )
+        has_core = has_search_or_ml_core or has_eval_with_ml_context
         has_delivery = sentence_has_any(sentence, production_terms + deployment_terms + scale_terms + impact_terms)
         has_action = sentence_has_any(sentence, ownership_terms + migration_terms + (
             "built",
@@ -3193,6 +3254,47 @@ def make_reasoning(
             "migrated",
         ))
         return bool(has_systems_signal and has_action)
+
+    core_evidence_sentences = [sentence for sentence in sentence_pool if professional_core_sentence(sentence)]
+    adjacent_evidence_sentences = [
+        sentence
+        for sentence in sentence_pool
+        if adjacent_systems_sentence(sentence) and not professional_core_sentence(sentence)
+    ]
+
+    has_direct_production_search = any(
+        sentence_has_any(sentence, retrieval_terms + ranking_terms + vector_terms)
+        and sentence_has_any(sentence, production_terms + deployment_terms + scale_terms + impact_terms)
+        for sentence in core_evidence_sentences
+    )
+    has_direct_retrieval = any(sentence_has_any(sentence, retrieval_terms) for sentence in core_evidence_sentences)
+    has_direct_ranking = any(sentence_has_any(sentence, ranking_terms) for sentence in core_evidence_sentences)
+    has_direct_vector = any(sentence_has_any(sentence, vector_terms) for sentence in core_evidence_sentences)
+    has_direct_evaluation = any(sentence_has_any(sentence, evaluation_terms) for sentence in core_evidence_sentences)
+    has_direct_production = any(sentence_has_any(sentence, production_terms + deployment_terms) for sentence in core_evidence_sentences)
+    has_direct_systems = any(sentence_has_any(sentence, systems_terms) for sentence in core_evidence_sentences + adjacent_evidence_sentences)
+    has_direct_ownership = any(sentence_has_any(sentence, ownership_terms) for sentence in core_evidence_sentences + adjacent_evidence_sentences)
+
+    strengths = []
+    add_strength(
+        0,
+        "production search and retrieval systems",
+        production_terms + retrieval_terms + ranking_terms,
+        has_direct_production_search,
+    )
+    add_strength(1, "search and retrieval", retrieval_terms, has_direct_retrieval)
+    add_strength(2, "ranking or recommendation systems", ranking_terms, has_direct_ranking)
+    add_strength(3, "vector search and embeddings", vector_terms + retrieval_terms, has_direct_vector)
+    add_strength(4, "evaluation and relevance measurement", evaluation_terms, has_direct_evaluation)
+    add_strength(5, "production deployment", production_terms, has_direct_production)
+    add_strength(6, "systems engineering", systems_terms, has_direct_systems)
+    add_strength(7, "ownership and delivery", ownership_terms, has_direct_ownership)
+    add_strength(8, "recruiter workflow context", recruiter_terms, text_has_any(recruiter_terms))
+    add_strength(9, "marketplace or matching systems", marketplace_terms, text_has_any(marketplace_terms))
+    add_strength(10, "written collaboration", writing_terms, text_has_any(writing_terms))
+    strengths.sort(key=lambda item: item[0])
+    primary_strength = strengths[0][1] if strengths else "the candidate's documented experience"
+    secondary_strengths = [label for _, label, _ in strengths[1:4]]
 
     def snippet_score(sentence: str, terms: tuple[str, ...]) -> tuple[float, int]:
         if low_confidence_sentence(sentence):
@@ -3289,9 +3391,8 @@ def make_reasoning(
 
     target_terms: tuple[str, ...] = tuple(dict.fromkeys(
         strengths[0][2]
-        + tuple(term for _, idx in positive[:4] for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query))
         if strengths
-        else tuple(term for _, idx in positive[:4] for term in list(chunks[idx].terms) + tokenize(chunks[idx].bm25_query))
+        else retrieval_terms + ranking_terms + vector_terms + evaluation_terms + systems_terms + ownership_terms
     ))
 
     scored_snippets: list[tuple[float, float, int, str]] = []
@@ -3390,9 +3491,9 @@ def make_reasoning(
             "Domain exposure to recruiting workflows makes the technical fit more relevant.",
         ],
         "general_fit": [
-            "The profile shows enough aligned technical evidence to merit an interview conversation.",
-            "Multiple parts of the profile line up with the role's core engineering needs.",
-            "The candidate has credible technical overlap with the role's search and ML priorities.",
+            "The profile has some reviewable overlap, but direct candidate-level search or ranking evidence is limited.",
+            "The candidate has partial role-adjacent signals rather than a clear production search/ranking match.",
+            "The available profile evidence is relevant only in a limited or adjacent way for this role.",
         ],
         "adjacent_systems": [
             "Transferable systems or data-platform experience is the main signal, but the fit is adjacent rather than core search/ranking ownership.",
@@ -3411,12 +3512,21 @@ def make_reasoning(
     )
     role_label = profile_role_label()
     if role_label and opening_category in {"adjacent_systems", "limited_professional_ml"}:
-        opening = deterministic_pick(
+        role_openings = (
             [
                 "{role} background is adjacent to this role; stronger evidence is in systems or data infrastructure than production search/ranking ownership.",
                 "{role} profile has transferable engineering depth, but direct production search/ranking ownership is not clearly established.",
                 "{role} experience is useful context, though the fit is adjacent rather than a proven production ML ranking match.",
-            ],
+            ]
+            if is_engineering_role(role_label)
+            else [
+                "{role} background is adjacent to this role; direct production search/ranking ownership is not shown.",
+                "{role} experience provides limited role-adjacent context rather than a proven production ML ranking match.",
+                "{role} profile reads as non-core for this ML search role, with the main question being depth of hands-on technical ownership.",
+            ]
+        )
+        opening = deterministic_pick(
+            role_openings,
             f"role-opening-{opening_category}",
         ).format(role=role_label)
     elif role_label and strong_professional_core:
@@ -3450,7 +3560,7 @@ def make_reasoning(
                 ],
                 "support-adjacent",
             ).format(snippet=evidence_snippet)
-    elif secondary_strengths:
+    elif secondary_strengths and (core_evidence_sentences or adjacent_evidence_sentences):
         support_sentence = f"Additional alignment in {', '.join(secondary_strengths[:2])} broadens the fit beyond a single area."
 
     def concern_from_chunk(chunk_id: str) -> str:
