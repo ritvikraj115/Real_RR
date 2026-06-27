@@ -1356,23 +1356,19 @@ def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
     """Yield candidate objects from JSON, JSONL, or gzipped JSON/JSONL.
 
     The hackathon sample tooling sometimes renames pretty-printed JSON to *.jsonl.
-    We first try to parse the whole file as JSON, then fall back to line-delimited
-    parsing so both formats are accepted safely.
+    Stream line-delimited inputs first so large candidate files do not require a
+    full-file read before L0 triage; fall back to whole-file parsing for JSON.
     """
     suffix = path.suffix.lower()
     is_gz = path.name.lower().endswith(".gz")
 
     if is_gz:
         import gzip as _gzip  # local import keeps the dependency optional
-        with _gzip.open(path, "rt", encoding="utf-8") as f:
-            raw_text = f.read()
-    else:
-        with path.open("r", encoding="utf-8") as f:
-            raw_text = f.read()
 
-    raw_text = raw_text.strip()
-    if not raw_text:
-        return
+    def open_text_file():
+        if is_gz:
+            return _gzip.open(path, "rt", encoding="utf-8")
+        return path.open("r", encoding="utf-8")
 
     def yield_from_parsed(data: Any) -> Iterable[dict[str, Any]]:
         if isinstance(data, list):
@@ -1383,6 +1379,39 @@ def iter_candidate_objects(path: Path) -> Iterable[dict[str, Any]]:
             yield data
         else:
             raise ValueError(f"Unsupported candidate JSON structure in {path}")
+
+    is_jsonl = suffix == ".jsonl" or path.name.lower().endswith(".jsonl.gz")
+    if is_jsonl:
+        fallback_to_full_json = False
+        yielded_any = False
+        with open_text_file() as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed_line = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    if not yielded_any:
+                        fallback_to_full_json = True
+                        break
+                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+                yielded_any = True
+                if isinstance(parsed_line, list):
+                    yield from parsed_line
+                elif isinstance(parsed_line, dict) and isinstance(parsed_line.get("candidates"), list):
+                    yield from parsed_line["candidates"]
+                else:
+                    yield parsed_line
+        if not fallback_to_full_json:
+            return
+
+    with open_text_file() as f:
+        raw_text = f.read()
+
+    raw_text = raw_text.strip()
+    if not raw_text:
+        return
 
     # First try a single JSON object / array. This handles pretty-printed JSON
     # that may have been saved with a .jsonl extension by the sandbox UI.
